@@ -12,15 +12,11 @@ import {
   Database,
   Download,
   FileSpreadsheet,
-  Folder,
   History,
-  Home,
   Loader2,
-  Menu,
   Plus,
   RefreshCw,
   Save,
-  Search,
   Settings,
   Sparkles,
   Trash2,
@@ -35,6 +31,7 @@ import { cn } from "@/lib/utils";
 import { EDITABLE_FIELDS, emptyRow, issueMap, validateRows } from "@/lib/validation";
 
 type Toast = { type: "success" | "error" | "info"; text: string };
+type ActivePage = "import" | "rules";
 
 type HistoryItem = {
   id: number;
@@ -90,6 +87,7 @@ const ROW_HEIGHT = 42;
 const PREVIEW_HEIGHT = 484;
 
 export function ImporterApp() {
+  const [activePage, setActivePage] = useState<ActivePage>("import");
   const [rules, setRules] = useState<RuleRecord[]>([]);
   const [selectedRuleId, setSelectedRuleId] = useState<string>("");
   const [ruleDraft, setRuleDraft] = useState<ParseRule>(BLANK_RULE);
@@ -123,6 +121,19 @@ export function ImporterApp() {
   }, []);
 
   useEffect(() => {
+    const syncPageFromHash = () => setActivePage(pageFromHash(window.location.hash));
+    syncPageFromHash();
+    window.addEventListener("hashchange", syncPageFromHash);
+    window.addEventListener("popstate", syncPageFromHash);
+    const id = window.setInterval(syncPageFromHash, 300);
+    return () => {
+      window.removeEventListener("hashchange", syncPageFromHash);
+      window.removeEventListener("popstate", syncPageFromHash);
+      window.clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => {
     const id = window.setTimeout(() => setToast(null), 3600);
     return () => window.clearTimeout(id);
   }, [toast]);
@@ -135,6 +146,7 @@ export function ImporterApp() {
   const errors = issues.filter((issue) => issue.severity === "error");
   const warnings = issues.filter((issue) => issue.severity === "warning");
   const mappedIssues = useMemo(() => issueMap(issues), [issues]);
+  const activePageTitle = activePage === "import" ? "批量导入" : "规则配置";
 
   async function loadRules() {
     try {
@@ -238,6 +250,8 @@ export function ImporterApp() {
       setRuleText(JSON.stringify(data.rule, null, 2));
       setAiNotes(data.notes ?? []);
       setSelectedRuleId("");
+      setActivePage("rules");
+      window.location.hash = "rules";
       showToast("success", "AI 已生成规则草案，请预览后保存");
     } catch (error) {
       showToast("error", getMessage(error));
@@ -882,68 +896,17 @@ export function ImporterApp() {
       <div className="zt-layout">
         <aside className="zt-sidebar">
           <div className="zt-org">
-            <Menu size={18} />
-            <span>总部</span>
-            <ChevronDown size={16} />
+            <Database size={18} />
+            <span>导入管理</span>
           </div>
-          <label className="zt-menu-search">
-            <Search size={17} />
-            <input placeholder="输入菜单名称" readOnly />
-          </label>
           <nav className="zt-menu" aria-label="主菜单">
-            <a>
-              <Home size={19} />
-              首页
+            <a href="#import" className={cn(activePage === "import" && "active")} onClick={() => setActivePage("import")}>
+              <UploadCloud size={19} />
+              批量导入
             </a>
-            <a>
-              <Folder size={19} />
-              PDA操作管理
-            </a>
-            <a>
+            <a href="#rules" className={cn(activePage === "rules" && "active")} onClick={() => setActivePage("rules")}>
               <ClipboardCheck size={19} />
-              OMS订单中心
-            </a>
-            <a>
-              <Folder size={19} />
-              基础管理
-            </a>
-            <a>
-              <RefreshCw size={19} />
-              仓链重构
-            </a>
-            <a>
-              <Folder size={19} />
-              工作台
-            </a>
-            <a className="active">
-              <Folder size={19} />
-              经营管理中心
-            </a>
-            <a>
-              <Folder size={19} />
-              冷链财务管理
-            </a>
-            <a>
-              <Folder size={19} />
-              数据预警
-            </a>
-            <a>
-              <Download size={19} />
-              中通冷链业务员APP
-            </a>
-          </nav>
-          <div className="zt-env-switch">
-            <span>预发环境</span>
-            <i />
-          </div>
-          <nav className="zt-menu zt-menu-bottom" aria-label="辅助菜单">
-            <a>
-              <Folder size={19} />
-              仓储中心
-            </a>
-            <a>
-              <Folder size={19} />
-              测试二级目录2
+              规则配置
             </a>
           </nav>
         </aside>
@@ -951,7 +914,7 @@ export function ImporterApp() {
         <section className="zt-content">
           <div className="zt-content-tabs">
             <button className="zt-collapse">《</button>
-            <div className="zt-tab-active">订单管理 <span>×</span></div>
+            <div className="zt-tab-active">{activePageTitle} <span>×</span></div>
             <div className="zt-tab-tools">
               <RefreshCw size={17} />
               <ChevronDown size={18} />
@@ -962,7 +925,7 @@ export function ImporterApp() {
       <section className="topbar">
         <div>
           <div className="eyebrow">智能多格式批量下单系统 V2</div>
-          <h1>万能导入工作台</h1>
+          <h1>{activePage === "import" ? "万能导入工作台" : "解析规则配置"}</h1>
         </div>
         <div className="top-actions">
           <StatusPill label="规则" value={`${rules.length} 条`} />
@@ -971,6 +934,8 @@ export function ImporterApp() {
         </div>
       </section>
 
+      {activePage === "import" ? (
+        <>
       <section className="flow-card">
         {["上传文件", "选择或生成规则", "试解析预览", "校验编辑", "提交下单"].map((item, index) => (
           <div className={cn("flow-step", progress.percent > index * 20 && "active")} key={item}>
@@ -1013,7 +978,7 @@ export function ImporterApp() {
             </div>
           )}
 
-          <PanelTitle icon={<ClipboardCheck size={18} />} title="解析规则" />
+          <PanelTitle icon={<ClipboardCheck size={18} />} title="选择解析规则" />
           <div className="rule-toolbar">
             <select value={selectedRuleId} onChange={(event) => onRuleSelect(event.target.value)}>
               <option value="">未选择，编辑草案</option>
@@ -1023,15 +988,6 @@ export function ImporterApp() {
                 </option>
               ))}
             </select>
-            <button className="icon-button" title="新建规则" onClick={newRule}>
-              <Plus size={16} />
-            </button>
-            <button className="icon-button" title="复制规则" onClick={duplicateRule}>
-              <Copy size={16} />
-            </button>
-            <button className="icon-button danger" title="删除规则" disabled={!selectedRuleId} onClick={deleteSelectedRule}>
-              <Trash2 size={16} />
-            </button>
           </div>
 
           <div className="button-row">
@@ -1039,31 +995,12 @@ export function ImporterApp() {
               {busy === "ai" ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
               AI 生成规则
             </button>
-            <button className="soft-button" disabled={Boolean(busy)} onClick={saveRule}>
-              {busy === "save-rule" ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-              保存
-            </button>
+            <a className="soft-button" href="#rules" onClick={() => setActivePage("rules")}>
+              <ClipboardCheck size={16} />
+              规则配置
+            </a>
           </div>
 
-          {!!aiNotes.length && (
-            <div className="note-box">
-              <strong>AI 推测说明</strong>
-              {aiNotes.slice(0, 4).map((note) => (
-                <span key={note}>{note}</span>
-              ))}
-            </div>
-          )}
-
-          <textarea
-            className="rule-editor"
-            spellCheck={false}
-            value={ruleText}
-            onChange={(event) => setRuleText(event.target.value)}
-            onBlur={() => {
-              const parsed = parseRuleText();
-              if (parsed) setRuleDraft(parsed);
-            }}
-          />
           <div className="button-row">
             <button className="primary-button full" disabled={!source || Boolean(busy)} onClick={previewParse}>
               {busy === "parse" ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
@@ -1271,6 +1208,66 @@ export function ImporterApp() {
           </button>
         </div>
       </section>
+        </>
+      ) : (
+        <section className="rule-config-page">
+          <section className="rule-config-panel">
+            <div className="panel-head">
+              <PanelTitle icon={<ClipboardCheck size={18} />} title="规则配置" />
+              <div className="button-row compact">
+                <button className="icon-button" title="新建规则" onClick={newRule}>
+                  <Plus size={16} />
+                </button>
+                <button className="icon-button" title="复制规则" onClick={duplicateRule}>
+                  <Copy size={16} />
+                </button>
+                <button className="icon-button danger" title="删除规则" disabled={!selectedRuleId} onClick={deleteSelectedRule}>
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            </div>
+
+            <div className="rule-config-toolbar">
+              <select value={selectedRuleId} onChange={(event) => onRuleSelect(event.target.value)}>
+                <option value="">未选择，编辑草案</option>
+                {rules.map((rule) => (
+                  <option value={rule.id} key={rule.id}>
+                    {rule.name}
+                  </option>
+                ))}
+              </select>
+              <button className="primary-button" disabled={!source || Boolean(busy)} onClick={generateRule}>
+                {busy === "ai" ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
+                AI 生成规则
+              </button>
+              <button className="soft-button" disabled={Boolean(busy)} onClick={saveRule}>
+                {busy === "save-rule" ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+                保存
+              </button>
+            </div>
+
+            {!!aiNotes.length && (
+              <div className="note-box">
+                <strong>AI 推测说明</strong>
+                {aiNotes.slice(0, 4).map((note) => (
+                  <span key={note}>{note}</span>
+                ))}
+              </div>
+            )}
+
+            <textarea
+              className="rule-editor rule-editor-large"
+              spellCheck={false}
+              value={ruleText}
+              onChange={(event) => setRuleText(event.target.value)}
+              onBlur={() => {
+                const parsed = parseRuleText();
+                if (parsed) setRuleDraft(parsed);
+              }}
+            />
+          </section>
+        </section>
+      )}
 
           </main>
         </section>
@@ -1297,6 +1294,10 @@ function StatusPill({ label, value, tone }: { label: string; value: string; tone
       <strong>{value}</strong>
     </div>
   );
+}
+
+function pageFromHash(hash: string): ActivePage {
+  return hash === "#rules" ? "rules" : "import";
 }
 
 function orderKeyPath(orderKey: string) {
