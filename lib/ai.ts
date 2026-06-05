@@ -31,6 +31,7 @@ export async function generateRuleWithLLM(source: ParsedSource): Promise<AiRuleR
     },
     body: JSON.stringify({
       model,
+      stream: true,
       temperature: 0.1,
       response_format: { type: "json_object" },
       messages: [
@@ -52,9 +53,9 @@ export async function generateRuleWithLLM(source: ParsedSource): Promise<AiRuleR
     throw new Error(`LLM 请求失败：${response.status} ${await response.text()}`);
   }
 
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("LLM 没有返回规则内容");
+  const raw = await response.text();
+  const content = extractChatContent(raw, response.headers.get("content-type"));
+  if (!content) throw new Error("LLM 没有返回规则内容，已确认接口可连通但返回为空");
 
   const parsed = safeJson(content);
   const rule = sanitizeRule(parsed.rule ?? parsed, source.fileName);
@@ -129,8 +130,46 @@ ${JSON.stringify(sample, null, 2)}`;
 
 function safeJson(content: string) {
   const trimmed = content.trim();
-  const jsonText = trimmed.startsWith("```") ? trimmed.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim() : trimmed;
+  const withoutFence = trimmed.startsWith("```") ? trimmed.replace(/^```(?:json)?/i, "").replace(/```$/, "").trim() : trimmed;
+  const jsonText = withoutFence.startsWith("{") ? withoutFence : extractJsonObject(withoutFence);
   return JSON.parse(jsonText);
+}
+
+function extractChatContent(raw: string, contentType: string | null) {
+  if (contentType?.includes("text/event-stream") || raw.trimStart().startsWith("data:")) {
+    return parseSseChatContent(raw);
+  }
+
+  const parsed = JSON.parse(raw);
+  return (
+    parsed.choices?.[0]?.message?.content ??
+    parsed.choices?.[0]?.delta?.content ??
+    parsed.output_text ??
+    parsed.content ??
+    ""
+  );
+}
+
+function parseSseChatContent(raw: string) {
+  let content = "";
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+
+    const parsed = JSON.parse(data);
+    const choice = parsed.choices?.[0];
+    content += choice?.delta?.content ?? choice?.message?.content ?? "";
+  }
+  return content.trim();
+}
+
+function extractJsonObject(text: string) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return text;
+  return text.slice(start, end + 1);
 }
 
 function sanitizeRule(input: Partial<ParseRule>, fileName: string): ParseRule {

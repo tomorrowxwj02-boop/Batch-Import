@@ -528,7 +528,7 @@ select:focus,
 
 .history-table {
   width: 100%;
-  min-width: 980px;
+  min-width: 1080px;
   border-collapse: collapse;
 }
 
@@ -550,6 +550,66 @@ select:focus,
   display: block;
   margin-top: 3px;
   color: var(--muted);
+}
+
+.history-expand {
+  min-width: 150px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--primary-dark);
+  padding: 0;
+  font-weight: 800;
+  text-align: left;
+}
+
+.history-expand span {
+  display: inline !important;
+  margin: 0 !important;
+  color: inherit !important;
+}
+
+.history-detail-row td {
+  background: #f9fcfd;
+  padding: 0;
+}
+
+.history-detail {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px 14px 42px;
+  border-left: 3px solid var(--primary);
+}
+
+.history-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-detail table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  border: 1px solid #dfe8ea;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.history-detail th,
+.history-detail td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #edf1f3;
+  font-size: 12px;
+}
+
+.history-detail th {
+  background: #eefafa;
+  color: #0b6e6e;
 }
 
 .empty-cell {

@@ -2,6 +2,8 @@
 
 import {
   AlertCircle,
+  ChevronDown,
+  ChevronRight,
   CheckCircle2,
   ClipboardCheck,
   Copy,
@@ -17,7 +19,7 @@ import {
   Trash2,
   UploadCloud
 } from "lucide-react";
-import { ChangeEvent, DragEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { BLANK_RULE } from "@/lib/default-rule";
 import { parseFileToSource, sampleSource, sourceStats } from "@/lib/client-file";
 import { parseWithRule } from "@/lib/rule-engine";
@@ -27,21 +29,29 @@ import { EDITABLE_FIELDS, emptyRow, issueMap, validateRows } from "@/lib/validat
 
 type Toast = { type: "success" | "error" | "info"; text: string };
 
-type HistoryRow = {
+type HistoryItem = {
   id: number;
-  external_code: string | null;
-  store_name: string | null;
-  receiver_name: string | null;
-  receiver_phone: string | null;
-  receiver_address: string | null;
   sku_code: string;
   sku_name: string;
   quantity: string;
   spec: string | null;
   remark: string | null;
+  created_at: string;
+};
+
+type HistoryOrder = {
+  order_key: string;
+  external_code: string | null;
+  store_name: string | null;
+  receiver_name: string | null;
+  receiver_phone: string | null;
+  receiver_address: string | null;
+  sku_count: number;
+  total_quantity: string;
   source_file: string | null;
   batch_id: string;
   created_at: string;
+  items: HistoryItem[];
 };
 
 const ROW_HEIGHT = 42;
@@ -63,13 +73,14 @@ export function ImporterApp() {
   const [aiNotes, setAiNotes] = useState<string[]>([]);
   const [metrics, setMetrics] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
-  const [history, setHistory] = useState<{ rows: HistoryRow[]; total: number; page: number; pageSize: number }>({
+  const [history, setHistory] = useState<{ rows: HistoryOrder[]; total: number; page: number; pageSize: number }>({
     rows: [],
     total: 0,
     page: 1,
     pageSize: 12
   });
   const [historyQuery, setHistoryQuery] = useState("");
+  const [expandedHistory, setExpandedHistory] = useState<Set<string>>(new Set());
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -116,6 +127,7 @@ export function ImporterApp() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "历史列表加载失败");
       setHistory(data);
+      setExpandedHistory((current) => new Set([...current].filter((key) => (data.rows ?? []).some((row: HistoryOrder) => row.order_key === key))));
     } catch (error) {
       showToast("error", getMessage(error));
     }
@@ -332,7 +344,7 @@ export function ImporterApp() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "提交失败");
-      showToast("success", `提交完成：成功 ${data.success} 条，失败 ${data.failed?.length ?? 0} 条`);
+      showToast("success", `提交完成：成功 ${data.success} 条 SKU，生成 ${data.orderCount ?? "-"} 张运单，失败 ${data.failed?.length ?? 0} 条`);
       await loadHistory(1);
       await checkDuplicates(rows);
     } catch (error) {
@@ -360,6 +372,31 @@ export function ImporterApp() {
     XLSX.utils.book_append_sheet(book, sheet, "预览数据");
     XLSX.writeFile(book, `万能导入预览-${Date.now()}.xlsx`);
     showToast("success", "Excel 已导出");
+  }
+
+  function toggleHistory(orderKey: string) {
+    setExpandedHistory((current) => {
+      const next = new Set(current);
+      if (next.has(orderKey)) next.delete(orderKey);
+      else next.add(orderKey);
+      return next;
+    });
+  }
+
+  async function deleteHistoryOrder(orderKey: string) {
+    if (!window.confirm("确认删除这张运单及其全部 SKU 明细？")) return;
+    setBusy(`history-delete:${orderKey}`);
+    try {
+      const res = await fetch(`/api/orders?orderKey=${encodeURIComponent(orderKey)}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "删除失败");
+      showToast("success", `已删除 ${data.deleted ?? 0} 条 SKU 明细`);
+      await loadHistory(history.page);
+    } catch (error) {
+      showToast("error", getMessage(error));
+    } finally {
+      setBusy("");
+    }
   }
 
   function moveFocus(event: KeyboardEvent<HTMLInputElement>, rowIndex: number, fieldIndex: number) {
@@ -635,29 +672,81 @@ export function ImporterApp() {
                 <th>收货门店</th>
                 <th>收件人</th>
                 <th>电话</th>
-                <th>SKU</th>
-                <th>数量</th>
+                <th>SKU 明细</th>
+                <th>数量合计</th>
                 <th>提交时间</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
               {history.rows.map((row) => (
-                <tr key={row.id}>
-                  <td>{row.external_code || "-"}</td>
-                  <td>{row.store_name || "-"}</td>
-                  <td>{row.receiver_name || "-"}</td>
-                  <td>{row.receiver_phone || "-"}</td>
-                  <td>
-                    <strong>{row.sku_code}</strong>
-                    <span>{row.sku_name}</span>
-                  </td>
-                  <td>{row.quantity}</td>
-                  <td>{new Date(row.created_at).toLocaleString("zh-CN")}</td>
-                </tr>
+                <Fragment key={row.order_key}>
+                  <tr key={row.order_key}>
+                    <td>
+                      <button className="history-expand" onClick={() => toggleHistory(row.order_key)} title="查看 SKU 明细">
+                        {expandedHistory.has(row.order_key) ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                        <span>{row.external_code || "无外部编码"}</span>
+                      </button>
+                    </td>
+                    <td>{row.store_name || "-"}</td>
+                    <td>{row.receiver_name || "-"}</td>
+                    <td>{row.receiver_phone || "-"}</td>
+                    <td>
+                      <strong>{row.sku_count} 条 SKU</strong>
+                      <span>{row.source_file || row.batch_id}</span>
+                    </td>
+                    <td>{row.total_quantity}</td>
+                    <td>{new Date(row.created_at).toLocaleString("zh-CN")}</td>
+                    <td>
+                      <button
+                        className="icon-button danger"
+                        title="删除整张运单"
+                        disabled={busy === `history-delete:${row.order_key}`}
+                        onClick={() => deleteHistoryOrder(row.order_key)}
+                      >
+                        {busy === `history-delete:${row.order_key}` ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+                      </button>
+                    </td>
+                  </tr>
+                  {expandedHistory.has(row.order_key) && (
+                    <tr className="history-detail-row" key={`${row.order_key}:items`}>
+                      <td colSpan={8}>
+                        <div className="history-detail">
+                          <div className="history-detail-meta">
+                            <span>收货地址：{row.receiver_address || "-"}</span>
+                            <span>批次：{row.batch_id}</span>
+                          </div>
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>SKU编码</th>
+                                <th>SKU名称</th>
+                                <th>规格</th>
+                                <th>数量</th>
+                                <th>备注</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {row.items.map((item) => (
+                                <tr key={item.id}>
+                                  <td>{item.sku_code}</td>
+                                  <td>{item.sku_name}</td>
+                                  <td>{item.spec || "-"}</td>
+                                  <td>{item.quantity}</td>
+                                  <td>{item.remark || "-"}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               ))}
               {!history.rows.length && (
                 <tr>
-                  <td colSpan={7} className="empty-cell">
+                  <td colSpan={8} className="empty-cell">
                     暂无历史运单
                   </td>
                 </tr>

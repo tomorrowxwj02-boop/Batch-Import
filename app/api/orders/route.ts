@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { insertOrders, listOrders } from "@/lib/db";
+import { deleteOrderGroup, insertOrders, listOrders } from "@/lib/db";
 import { OrderRow } from "@/lib/types";
 import { validateRows } from "@/lib/validation";
 
@@ -28,6 +28,20 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "存在未修正的错误行", issues }, { status: 400 });
     }
     const result = await insertOrders({ rows, sourceFile: body.sourceFile });
+    return NextResponse.json(result);
+  } catch (error) {
+    return NextResponse.json({ error: getMessage(error) }, { status: 500 });
+  }
+}
+
+export async function DELETE(request: Request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const orderKey = searchParams.get("orderKey");
+    if (!orderKey) {
+      return NextResponse.json({ error: "缺少运单标识" }, { status: 400 });
+    }
+    const result = await deleteOrderGroup(orderKey);
     return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json({ error: getMessage(error) }, { status: 500 });

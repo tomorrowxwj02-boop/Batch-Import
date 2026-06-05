@@ -123,6 +123,7 @@ export async function insertOrders(input: {
   const db = sql();
   const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   let success = 0;
+  const orderKeys = new Set<string>();
   const failed: Array<{ index: number; reason: string }> = [];
 
   for (let index = 0; index < input.rows.length; index += 1) {
@@ -142,12 +143,13 @@ export async function insertOrders(input: {
         )
       `;
       success += 1;
+      orderKeys.add(row.externalCode ? `code:${row.externalCode}` : `row:${index + 1}`);
     } catch (error) {
       failed.push({ index: index + 1, reason: error instanceof Error ? error.message : "未知数据库错误" });
     }
   }
 
-  return { batchId, success, failed };
+  return { batchId, success, orderCount: orderKeys.size, failed };
 }
 
 export async function listOrders(input: {
@@ -167,27 +169,106 @@ export async function listOrders(input: {
   const to = input.dateTo || null;
 
   const rows = await db`
-    select id, external_code, store_name, receiver_name, receiver_phone, receiver_address,
-           sku_code, sku_name, quantity::text, spec, remark, source_file, batch_id, created_at
-    from imported_orders
-    where (${q || null}::text is null
-      or external_code ilike ${q ? `%${q}%` : null}
-      or receiver_name ilike ${q ? `%${q}%` : null}
-      or store_name ilike ${q ? `%${q}%` : null})
-      and (${from}::text is null or created_at >= ${from}::timestamptz)
-      and (${to}::text is null or created_at <= ${to}::timestamptz)
-    order by created_at desc, id desc
+    with all_rows as (
+      select *,
+             case
+               when nullif(external_code, '') is null then 'row:' || id::text
+               else 'code:' || external_code
+             end as order_key
+      from imported_orders
+      where (${from}::text is null or created_at >= ${from}::timestamptz)
+        and (${to}::text is null or created_at <= ${to}::timestamptz)
+    ),
+    matched_keys as (
+      select distinct order_key
+      from all_rows
+      where ${q || null}::text is null
+        or external_code ilike ${q ? `%${q}%` : null}
+        or receiver_name ilike ${q ? `%${q}%` : null}
+        or receiver_phone ilike ${q ? `%${q}%` : null}
+        or receiver_address ilike ${q ? `%${q}%` : null}
+        or store_name ilike ${q ? `%${q}%` : null}
+        or sku_code ilike ${q ? `%${q}%` : null}
+        or sku_name ilike ${q ? `%${q}%` : null}
+    )
+    select
+      all_rows.order_key,
+      max(all_rows.external_code) as external_code,
+      max(all_rows.store_name) as store_name,
+      max(all_rows.receiver_name) as receiver_name,
+      max(all_rows.receiver_phone) as receiver_phone,
+      max(all_rows.receiver_address) as receiver_address,
+      count(*)::int as sku_count,
+      coalesce(sum(all_rows.quantity), 0)::text as total_quantity,
+      max(all_rows.source_file) as source_file,
+      max(all_rows.batch_id) as batch_id,
+      max(all_rows.created_at) as created_at,
+      json_agg(
+        json_build_object(
+          'id', all_rows.id,
+          'sku_code', all_rows.sku_code,
+          'sku_name', all_rows.sku_name,
+          'quantity', all_rows.quantity::text,
+          'spec', all_rows.spec,
+          'remark', all_rows.remark,
+          'created_at', all_rows.created_at
+        )
+        order by all_rows.id asc
+      ) as items
+    from all_rows
+    join matched_keys on matched_keys.order_key = all_rows.order_key
+    group by all_rows.order_key
+    order by max(all_rows.created_at) desc, max(all_rows.id) desc
     limit ${pageSize} offset ${offset}
   `;
   const countRows = await db`
-    select count(*)::int as total
-    from imported_orders
-    where (${q || null}::text is null
+    with all_rows as (
+      select *,
+             case
+               when nullif(external_code, '') is null then 'row:' || id::text
+               else 'code:' || external_code
+             end as order_key
+      from imported_orders
+      where (${from}::text is null or created_at >= ${from}::timestamptz)
+        and (${to}::text is null or created_at <= ${to}::timestamptz)
+    )
+    select count(distinct order_key)::int as total
+    from all_rows
+    where ${q || null}::text is null
       or external_code ilike ${q ? `%${q}%` : null}
       or receiver_name ilike ${q ? `%${q}%` : null}
-      or store_name ilike ${q ? `%${q}%` : null})
-      and (${from}::text is null or created_at >= ${from}::timestamptz)
-      and (${to}::text is null or created_at <= ${to}::timestamptz)
+      or receiver_phone ilike ${q ? `%${q}%` : null}
+      or receiver_address ilike ${q ? `%${q}%` : null}
+      or store_name ilike ${q ? `%${q}%` : null}
+      or sku_code ilike ${q ? `%${q}%` : null}
+      or sku_name ilike ${q ? `%${q}%` : null}
   `;
   return { rows, total: Number(countRows[0]?.total ?? 0), page, pageSize };
+}
+
+export async function deleteOrderGroup(orderKey: string) {
+  await ensureSchema();
+  const db = sql();
+  if (orderKey.startsWith("code:")) {
+    const externalCode = orderKey.slice("code:".length);
+    const rows = await db`
+      delete from imported_orders
+      where external_code = ${externalCode}
+      returning id
+    `;
+    return { deleted: rows.length };
+  }
+
+  if (orderKey.startsWith("row:")) {
+    const id = Number(orderKey.slice("row:".length));
+    if (!Number.isFinite(id)) throw new Error("无效的运单标识");
+    const rows = await db`
+      delete from imported_orders
+      where id = ${id}
+      returning id
+    `;
+    return { deleted: rows.length };
+  }
+
+  throw new Error("无效的运单标识");
 }
