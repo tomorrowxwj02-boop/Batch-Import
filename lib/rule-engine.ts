@@ -31,6 +31,76 @@ type RowObject = Partial<Record<FieldKey, string>> & {
   sourceSheet?: string;
   sourceRow?: number;
 };
+type HeaderLocator = { rowIndex?: number; findByKeywords?: string[]; maxScanRows?: number; rowStart?: number; rowEnd?: number };
+type RuntimeMatrixStrategy = Omit<Extract<ParseStrategy, { type: "matrix" }>, "headerRow" | "dataStartRow" | "rowFields" | "pivot" | "cell"> & {
+  headerRow?: number;
+  dataStartRow?: number;
+  rowFields?: Partial<Record<FieldKey, ColumnSelector | string>>;
+  header?: HeaderLocator;
+  columns?: Partial<Record<FieldKey, ColumnSelector | string>>;
+  dataStartRowOffset?: number;
+  pivot?: Partial<Extract<ParseStrategy, { type: "matrix" }>["pivot"]> & {
+    columns?: {
+      startAfter?: ColumnSelector | string;
+      endBefore?: ColumnSelector | string;
+      startAfterCandidates?: string[];
+      endBeforeCandidates?: string[];
+      excludeCandidates?: string[];
+    };
+    headerSource?: string;
+    headerValue?: boolean;
+  };
+  cell?: Partial<Extract<ParseStrategy, { type: "matrix" }>["cell"]> & {
+    emitWhen?: "positive";
+    skipEmpty?: boolean;
+    skipZero?: boolean;
+    field?: FieldKey;
+  };
+};
+type RuntimeCardStrategy = Omit<Extract<ParseStrategy, { type: "cards" }>, "boundary" | "tableHeader" | "columns"> & {
+  boundary?: { pattern?: string; column?: number };
+  tableHeader?: { findByKeywords?: string[]; offsetFromBoundary?: number; maxRows?: number };
+  columns?: Partial<Record<FieldKey, ColumnSelector | string>>;
+};
+
+const DEFAULT_ITEM_HEADER_KEYWORDS = ["物品编码", "商品编码", "SKU编码", "物品名称", "商品名称", "SKU名称", "规格", "数量"];
+const DEFAULT_TABLE_HEADER_KEYWORDS = ["编码", "名称", "数量"];
+const DEFAULT_ITEM_COLUMNS: Partial<Record<FieldKey, ColumnSelector>> = {
+  externalCode: { candidates: ["外部编码", "单据号", "配送单号", "订单号", "调拨单号"] },
+  storeName: { candidates: ["收货门店", "调入门店", "门店", "机构"] },
+  receiverName: { candidates: ["收件人", "收货人", "联系人"] },
+  receiverPhone: { candidates: ["电话", "联系电话", "收货电话", "手机"] },
+  receiverAddress: { candidates: ["地址", "收货地址"] },
+  skuCode: { candidates: ["物品编码", "SKU编码", "商品编码", "SKU条码", "商品条码", "编码"] },
+  skuName: { candidates: ["物品名称", "SKU名称", "商品名称", "品名", "名称"] },
+  quantity: { candidates: ["发货数量", "出库数量", "调拨数量", "数量"] },
+  spec: { candidates: ["规格型号", "规格", "型号"] },
+  remark: { candidates: ["备注"] }
+};
+const MATRIX_EXCLUDED_HEADER_KEYWORDS = [
+  "仓库",
+  "货主",
+  "sku",
+  "商品编码",
+  "物品编码",
+  "条码",
+  "库存",
+  "库存状态",
+  "库存单位",
+  "在库",
+  "可用",
+  "待移入",
+  "分配",
+  "冻结",
+  "结余",
+  "规格",
+  "单位",
+  "状态",
+  "数量",
+  "总和",
+  "合计",
+  "总计"
+];
 
 export type ParseResult = {
   rows: OrderRow[];
@@ -112,10 +182,7 @@ function parseTableSheet(
   strategy: Extract<ParseStrategy, { type: "table" }>,
   warnings: string[]
 ) {
-  const headerIndex =
-    typeof strategy.header.rowIndex === "number"
-      ? strategy.header.rowIndex
-      : findHeaderRow(sheet.rows, strategy.header.findByKeywords ?? [], strategy.header.maxScanRows ?? 30);
+  const headerIndex = locateHeaderRow(sheet.rows, strategy.header, DEFAULT_TABLE_HEADER_KEYWORDS, 30);
 
   if (headerIndex < 0) {
     warnings.push(`${sheet.name} 未找到表头，已跳过表格策略`);
@@ -138,7 +205,7 @@ function parseTableSheet(
       header,
       sheet,
       rowIndex,
-      columns: strategy.columns,
+      columns: normalizeColumns(strategy.columns, DEFAULT_ITEM_COLUMNS),
       defaults: { ...rule.defaults, ...strategy.defaults },
       common
     });
@@ -160,19 +227,37 @@ function parseMatrixSheet(
   strategy: Extract<ParseStrategy, { type: "matrix" }>,
   warnings: string[]
 ) {
-  const header = sheet.rows[strategy.headerRow] ?? [];
+  const runtime = strategy as RuntimeMatrixStrategy;
+  const headerIndex = locateHeaderRow(
+    sheet.rows,
+    typeof runtime.headerRow === "number" ? { rowIndex: runtime.headerRow } : runtime.header,
+    matrixHeaderKeywords(runtime),
+    30
+  );
+  const header = sheet.rows[headerIndex] ?? [];
   if (!header.length) {
     warnings.push(`${sheet.name} 矩阵表头为空，已跳过矩阵策略`);
     return [];
   }
 
-  const pivotHeaderRow = sheet.rows[strategy.pivot.headerRow ?? strategy.headerRow] ?? [];
-  const common = collectCommon(sheet, rule, strategy, undefined);
-  const start = strategy.pivot.startColumn;
-  const end = Math.min(strategy.pivot.endColumn ?? pivotHeaderRow.length - 1, pivotHeaderRow.length - 1);
-  const rows: RowObject[] = [];
+  const pivot = runtime.pivot ?? {};
+  const pivotHeaderRow = sheet.rows[pivot.headerRow ?? headerIndex] ?? [];
+  const pivotRange = resolveMatrixPivotRange(pivotHeaderRow, runtime);
+  if (!pivotRange) {
+    warnings.push(`${sheet.name} 未识别到矩阵门店列，已跳过矩阵策略`);
+    return [];
+  }
 
-  for (let rowIndex = strategy.dataStartRow; rowIndex < sheet.rows.length; rowIndex += 1) {
+  const rowColumns = normalizeColumns(runtime.rowFields ?? runtime.columns, DEFAULT_ITEM_COLUMNS);
+  const common = collectCommon(sheet, rule, strategy, undefined);
+  const start = pivotRange.start;
+  const end = pivotRange.end;
+  const pivotField = pivot.field ?? "storeName";
+  const cellMode = runtime.cell?.mode ?? "quantity";
+  const rows: RowObject[] = [];
+  const dataStart = typeof runtime.dataStartRow === "number" ? runtime.dataStartRow : headerIndex + (runtime.dataStartRowOffset ?? 1);
+
+  for (let rowIndex = dataStart; rowIndex < sheet.rows.length; rowIndex += 1) {
     const row = sheet.rows[rowIndex] ?? [];
     if (isEffectivelyEmpty(row)) continue;
     if (shouldStop(row, header, strategy.stopWhen)) break;
@@ -182,34 +267,35 @@ function parseMatrixSheet(
       header,
       sheet,
       rowIndex,
-      columns: strategy.rowFields,
+      columns: rowColumns,
       defaults: { ...rule.defaults, ...strategy.defaults },
       common
     });
 
     for (let colIndex = start; colIndex <= end; colIndex += 1) {
+      if (!isLikelyPivotHeader(pivotHeaderRow[colIndex], runtime.pivot?.columns?.excludeCandidates)) continue;
       const raw = row[colIndex];
       const cellText = toText(raw);
       if (!cellText) continue;
       const pivotLabel = toText(pivotHeaderRow[colIndex]);
       if (!pivotLabel) continue;
 
-      if (strategy.cell.mode === "quantity") {
+      if (cellMode === "quantity") {
         const quantity = numericText(cellText);
         if (!quantity) continue;
         rows.push({
           ...base,
-          [strategy.pivot.field]: `${strategy.pivot.valuePrefix ?? ""}${pivotLabel}`,
+          [pivotField]: `${pivot.valuePrefix ?? ""}${pivotLabel}`,
           quantity,
           sourceSheet: sheet.name,
           sourceRow: rowIndex + 1
         });
       } else {
-        const itemRows = splitCompositeItems(cellText, strategy.cell.itemPattern);
+        const itemRows = splitCompositeItems(cellText, runtime.cell?.itemPattern);
         itemRows.forEach((item, itemIndex) => {
           rows.push({
             ...base,
-            [strategy.pivot.field]: `${strategy.pivot.valuePrefix ?? ""}${pivotLabel}`,
+            [pivotField]: `${pivot.valuePrefix ?? ""}${pivotLabel}`,
             skuName: item.name || base.skuName || "",
             skuCode: item.code || base.skuCode || `${pivotLabel}-${rowIndex + 1}-${itemIndex + 1}`,
             quantity: item.quantity,
@@ -231,10 +317,8 @@ function parseCardSheet(
   strategy: Extract<ParseStrategy, { type: "cards" }>,
   warnings: string[]
 ) {
-  const boundaryRe = new RegExp(strategy.boundary.pattern);
-  const boundaryRows = sheet.rows
-    .map((row, index) => ({ row, index }))
-    .filter(({ row }) => boundaryRe.test(toText(row[strategy.boundary.column ?? 0]) || row.map(toText).join(" ")));
+  const runtime = strategy as RuntimeCardStrategy;
+  const boundaryRows = findCardBoundaryRows(sheet, runtime);
 
   if (!boundaryRows.length) {
     warnings.push(`${sheet.name} 未识别到卡片边界，已跳过卡片策略`);
@@ -246,31 +330,37 @@ function parseCardSheet(
     const end = boundaryRows[cardIndex + 1]?.index ?? sheet.rows.length;
     const cardRows = sheet.rows.slice(start, end);
     const cardSheet: SheetContext = { name: sheet.name, rows: cardRows };
+    const tableHeader = runtime.tableHeader ?? {};
     const headerOffset =
-      typeof strategy.tableHeader.offsetFromBoundary === "number"
-        ? strategy.tableHeader.offsetFromBoundary
-        : findHeaderRow(cardRows, strategy.tableHeader.findByKeywords ?? [], strategy.tableHeader.maxRows ?? 12);
+      typeof tableHeader.offsetFromBoundary === "number"
+        ? tableHeader.offsetFromBoundary
+        : findHeaderRow(cardRows, tableHeader.findByKeywords?.length ? tableHeader.findByKeywords : DEFAULT_ITEM_HEADER_KEYWORDS, tableHeader.maxRows ?? 12);
 
     if (headerOffset < 0) return;
     const header = cardRows[headerOffset] ?? [];
-    const common = collectCommon(cardSheet, rule, strategy, {
-      ...strategy.common,
-      ...strategy.cardCommon
-    });
+    const autoCommon = inferCardCommon(sheet, cardRows, start, cardIndex);
+    const common = {
+      ...autoCommon,
+      ...evaluateCommonExtractors(rule.common, sheet),
+      ...evaluateCommonExtractors(strategy.common, cardSheet),
+      ...evaluateCommonExtractors(strategy.cardCommon, cardSheet)
+    };
+    const columns = normalizeColumns(runtime.columns, DEFAULT_ITEM_COLUMNS);
 
     for (let localRow = headerOffset + 1; localRow < cardRows.length; localRow += 1) {
       const row = cardRows[localRow] ?? [];
       if (isEffectivelyEmpty(row)) continue;
+      if (matchesAnyCell(row, ["合计", "总计"])) break;
       const record = materializeRecord({
         row,
         header,
         sheet,
         rowIndex: start + localRow,
-        columns: strategy.columns,
+        columns,
         defaults: { ...rule.defaults, ...strategy.defaults },
         common
       });
-      if (toText(record.skuCode) || toText(record.skuName)) rows.push(record);
+      if ((toText(record.skuCode) || toText(record.skuName)) && toText(record.quantity)) rows.push(record);
     }
   });
 
@@ -328,6 +418,216 @@ function findHeaderRow(rows: CellValue[][], keywords: string[], maxScanRows: num
     }
   }
   return bestScore > 0 ? bestIndex : -1;
+}
+
+function locateHeaderRow(rows: CellValue[][], locator: HeaderLocator | undefined, fallbackKeywords: string[], fallbackMaxRows: number) {
+  if (typeof locator?.rowIndex === "number") return locator.rowIndex;
+
+  const keywords = locator?.findByKeywords?.length ? locator.findByKeywords : fallbackKeywords;
+  const start = Math.max(locator?.rowStart ?? 0, 0);
+  const end =
+    typeof locator?.rowEnd === "number"
+      ? Math.min(locator.rowEnd + 1, rows.length)
+      : Math.min(start + (locator?.maxScanRows ?? fallbackMaxRows), rows.length);
+
+  const sliced = rows.slice(start, end);
+  const found = findHeaderRow(sliced, keywords, sliced.length);
+  return found >= 0 ? start + found : -1;
+}
+
+function matrixHeaderKeywords(strategy: RuntimeMatrixStrategy) {
+  const explicit = strategy.header?.findByKeywords ?? [];
+  const columnKeywords = selectorKeywords(strategy.rowFields ?? strategy.columns);
+  return uniqueText([...explicit, ...columnKeywords, ...DEFAULT_ITEM_HEADER_KEYWORDS]);
+}
+
+function resolveMatrixPivotRange(header: CellValue[], strategy: RuntimeMatrixStrategy) {
+  const pivot = strategy.pivot ?? {};
+  const columns = pivot.columns;
+  const startAfter = resolveColumnFromOptions(header, columns?.startAfter, columns?.startAfterCandidates);
+  const endBefore = resolveColumnFromOptions(header, columns?.endBefore, columns?.endBeforeCandidates);
+  const likelyColumns = header
+    .map((cell, index) => ({ cell, index }))
+    .filter(({ cell }) => isLikelyPivotHeader(cell, columns?.excludeCandidates))
+    .map(({ index }) => index);
+
+  let start =
+    typeof pivot.startColumn === "number"
+      ? pivot.startColumn
+      : startAfter >= 0
+        ? startAfter + 1
+        : likelyColumns[0];
+  let end =
+    typeof pivot.endColumn === "number"
+      ? pivot.endColumn
+      : endBefore >= 0
+        ? endBefore - 1
+        : likelyColumns[likelyColumns.length - 1];
+
+  if (typeof start !== "number" || typeof end !== "number") return null;
+  start = Math.max(start, 0);
+  end = Math.min(end, header.length - 1);
+  while (start <= end && !isLikelyPivotHeader(header[start], columns?.excludeCandidates)) start += 1;
+  while (end >= start && !isLikelyPivotHeader(header[end], columns?.excludeCandidates)) end -= 1;
+  return start <= end ? { start, end } : null;
+}
+
+function resolveColumnFromOptions(header: CellValue[], selector?: ColumnSelector | string, candidates?: string[]) {
+  const normalized = normalizeColumnSelector(selector);
+  const candidateSelector = candidates?.length ? { candidates } : undefined;
+  const column = normalized ? resolveColumn(normalized, header) : -1;
+  return column >= 0 || !candidateSelector ? column : resolveColumn(candidateSelector, header);
+}
+
+function isLikelyPivotHeader(value: unknown, extraExcludes: string[] = []) {
+  const text = toText(value);
+  const normalized = normalizeText(text);
+  if (!normalized) return false;
+  const excludes = uniqueText([...MATRIX_EXCLUDED_HEADER_KEYWORDS, ...extraExcludes]).map(normalizeText);
+  if (excludes.some((keyword) => normalized === keyword || normalized.includes(keyword))) return false;
+  return true;
+}
+
+function findCardBoundaryRows(sheet: SheetContext, strategy: RuntimeCardStrategy) {
+  const pattern = strategy.boundary?.pattern;
+  if (pattern) {
+    try {
+      const boundaryRe = new RegExp(pattern);
+      const matches = sheet.rows
+        .map((row, index) => ({ row, index }))
+        .filter(({ row }) => boundaryRe.test(toText(row[strategy.boundary?.column ?? 0]) || row.map(toText).join(" ")));
+      if (matches.length) return matches;
+    } catch {
+      // Ignore invalid AI-generated boundary patterns and use structural detection below.
+    }
+  }
+
+  const candidates = sheet.rows.map((row, index) => ({ row, index }));
+  const markerMatches = candidates.filter(({ row }) => {
+    const text = normalizeText(row.map(toText).join(" "));
+    return /(?:调拨|配送|发货|订单|出库)?记录[#＃]?\d+/.test(text) || /^▶/.test(toText(row[0]));
+  });
+  if (markerMatches.length) return markerMatches;
+
+  return candidates.filter(({ row }) => {
+    const first = normalizeText(row[0]);
+    return first.includes("调入门店") || first.includes("收货门店");
+  });
+}
+
+function inferCardCommon(sheet: SheetContext, cardRows: CellValue[][], absoluteStart: number, cardIndex: number): Partial<Record<FieldKey, string>> {
+  const globalRows = sheet.rows.slice(0, Math.min(Math.max(absoluteStart, 1), 12));
+  const cardCode = extractLabeledValue(cardRows, ["外部编码", "配送单号", "订单号", "调拨单号", "单号"]);
+  const globalCode = extractLabeledValue(globalRows, ["外部编码", "配送单号", "订单号", "调拨单号", "单号"]);
+  const marker = extractCardMarker(cardRows) || String(cardIndex + 1);
+  const externalCode = cardCode || (globalCode ? `${globalCode}-${marker}` : "");
+
+  return {
+    externalCode,
+    storeName: extractLabeledValue(cardRows, ["调入门店", "收货门店", "收货机构", "门店", "机构"]),
+    receiverName: extractLabeledValue(cardRows, ["收货人", "收件人", "联系人"]),
+    receiverPhone: extractLabeledValue(cardRows, ["联系电话", "收货电话", "电话", "手机"]),
+    receiverAddress: extractLabeledValue(cardRows, ["收货地址", "地址"])
+  };
+}
+
+function extractCardMarker(rows: CellValue[][]) {
+  const text = rows
+    .slice(0, 3)
+    .map((row) => row.map(toText).join(" "))
+    .join(" ");
+  const match = text.match(/[#＃]\s*([A-Za-z0-9_-]+)/) ?? text.match(/第\s*([A-Za-z0-9_-]+)\s*(?:张|条|个|单|组|块)/);
+  return match?.[1] ?? "";
+}
+
+function extractLabeledValue(rows: CellValue[][], labels: string[]) {
+  const normalizedLabels = labels.map(normalizeText);
+  for (const row of rows) {
+    for (let colIndex = 0; colIndex < row.length; colIndex += 1) {
+      const cellText = toText(row[colIndex]);
+      if (!cellText) continue;
+      const normalizedCell = normalizeText(cellText);
+      for (let labelIndex = 0; labelIndex < labels.length; labelIndex += 1) {
+        const label = labels[labelIndex];
+        const normalizedLabel = normalizedLabels[labelIndex];
+        if (normalizedCell === normalizedLabel || normalizedCell.includes(`${normalizedLabel}:`)) {
+          const inline = extractInlineLabelValue(cellText, label);
+          if (inline) return inline;
+          const right = toText(row[colIndex + 1]);
+          if (right) return right;
+        }
+      }
+    }
+    const rowText = row.map(toText).join(" | ");
+    for (const label of labels) {
+      const inline = extractInlineLabelValue(rowText, label);
+      if (inline) return inline;
+    }
+  }
+  return "";
+}
+
+function extractInlineLabelValue(text: string, label: string) {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = text.match(new RegExp(`${escaped}\\s*[:：]\\s*([^|\\n\\r]+)`, "i"));
+  return match ? toText(match[1]) : "";
+}
+
+function evaluateCommonExtractors(extractors: Partial<Record<FieldKey, Extractor>> | undefined, sheet: SheetContext) {
+  const common: Partial<Record<FieldKey, string>> = {};
+  FIELDS.forEach((field) => {
+    const extractor = extractors?.[field];
+    if (extractor) common[field] = evaluateExtractor(extractor, sheet);
+  });
+  return common;
+}
+
+function normalizeColumns(
+  columns: Partial<Record<FieldKey, ColumnSelector | string>> | undefined,
+  defaults: Partial<Record<FieldKey, ColumnSelector>> = {}
+) {
+  const normalized: Partial<Record<FieldKey, ColumnSelector>> = {};
+  FIELDS.forEach((field) => {
+    const fallback = defaults[field];
+    const selector = normalizeColumnSelector(columns?.[field]);
+    if (fallback || selector) normalized[field] = mergeColumnSelectors(fallback, selector);
+  });
+  return normalized;
+}
+
+function normalizeColumnSelector(value: unknown): ColumnSelector | undefined {
+  if (!value) return undefined;
+  if (typeof value === "string") return { candidates: [value] };
+  if (Array.isArray(value)) return { candidates: value.map(toText).filter(Boolean) };
+  if (typeof value !== "object") return undefined;
+
+  const input = value as { index?: unknown; header?: unknown; candidates?: unknown };
+  const selector: ColumnSelector = {};
+  if (typeof input.index === "number") selector.index = input.index;
+  if (typeof input.header === "string") selector.header = input.header;
+  if (Array.isArray(input.candidates)) selector.candidates = input.candidates.map(toText).filter(Boolean);
+  return selector.index !== undefined || selector.header || selector.candidates?.length ? selector : undefined;
+}
+
+function mergeColumnSelectors(fallback?: ColumnSelector, selector?: ColumnSelector): ColumnSelector {
+  if (!fallback) return selector ?? {};
+  if (!selector) return fallback;
+  return {
+    index: selector.index ?? fallback.index,
+    header: selector.header ?? fallback.header,
+    candidates: uniqueText([selector.header, ...(selector.candidates ?? []), fallback.header, ...(fallback.candidates ?? [])])
+  };
+}
+
+function selectorKeywords(columns?: Partial<Record<FieldKey, ColumnSelector | string>>) {
+  return FIELDS.flatMap((field) => {
+    const selector = normalizeColumnSelector(columns?.[field]);
+    return [selector?.header, ...(selector?.candidates ?? [])].filter((value): value is string => Boolean(value));
+  });
+}
+
+function uniqueText(values: Array<string | undefined>) {
+  return Array.from(new Set(values.map((value) => toText(value)).filter(Boolean)));
 }
 
 function collectCommon(

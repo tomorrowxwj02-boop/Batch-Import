@@ -101,8 +101,8 @@ ParseRule = {
 
 支持的 Strategy：
 1. table：通过 header.findByKeywords 找表头，通过 columns 的 candidates/index 映射列，common 可用 labelRight/cell/regex/sheetName/static 抽取尾部或头部公共信息。
-2. matrix：将横向门店/日期列转置为行，pivot.field 常用 storeName，cell.mode 可为 quantity 或 items。
-3. cards：用 boundary.pattern 切卡片，每张卡片内找小表。
+2. matrix：将横向门店/日期列转置为行。必须给出 header.findByKeywords、columns、pivot.field、pivot.columns.startAfterCandidates/endBeforeCandidates 或 pivot.startColumn/endColumn，cell.mode 可为 quantity 或 items。
+3. cards：用 boundary.pattern 切卡片，每张卡片内找小表。必须给出 boundary.pattern、tableHeader.findByKeywords、columns；卡片公共字段可用 cardCommon 或由调入门店/收货人/电话/地址等标签推断。
 4. textSegments：用 segmentBoundary 分段，再用 commonPatterns 和 itemLinePattern 抽纯文本/PDF 文本。
 
 Extractor 可用：
