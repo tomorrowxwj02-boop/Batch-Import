@@ -74,8 +74,8 @@ export function validateRows(rows: OrderRow[], existingDuplicateCodes = new Set<
         rowId: row.id,
         rowNo,
         field: "externalCode",
-        message: "外部编码已存在于历史运单",
-        severity: "error"
+        message: "外部编码已存在，将作为同一运单追加/合并 SKU，请核对明细",
+        severity: "warning"
       });
     }
 

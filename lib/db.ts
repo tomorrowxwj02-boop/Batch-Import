@@ -3,6 +3,24 @@ import { ParseRule } from "@/lib/types";
 
 let migrationPromise: Promise<void> | null = null;
 
+type ParsedOrderKey = { type: "code"; externalCode: string } | { type: "row"; id: number };
+
+type OrderHeaderInput = {
+  externalCode: string;
+  storeName: string;
+  receiverName: string;
+  receiverPhone: string;
+  receiverAddress: string;
+};
+
+type OrderItemInput = {
+  skuCode: string;
+  skuName: string;
+  quantity: string;
+  spec: string;
+  remark: string;
+};
+
 function sql() {
   const url = process.env.DATABASE_URL || process.env.POSTGRES_URL;
   if (!url) throw new Error("缺少 DATABASE_URL / POSTGRES_URL 环境变量");
@@ -202,19 +220,7 @@ export async function listOrders(input: {
       coalesce(sum(all_rows.quantity), 0)::text as total_quantity,
       max(all_rows.source_file) as source_file,
       max(all_rows.batch_id) as batch_id,
-      max(all_rows.created_at) as created_at,
-      json_agg(
-        json_build_object(
-          'id', all_rows.id,
-          'sku_code', all_rows.sku_code,
-          'sku_name', all_rows.sku_name,
-          'quantity', all_rows.quantity::text,
-          'spec', all_rows.spec,
-          'remark', all_rows.remark,
-          'created_at', all_rows.created_at
-        )
-        order by all_rows.id asc
-      ) as items
+      max(all_rows.created_at) as created_at
     from all_rows
     join matched_keys on matched_keys.order_key = all_rows.order_key
     group by all_rows.order_key
@@ -246,29 +252,289 @@ export async function listOrders(input: {
   return { rows, total: Number(countRows[0]?.total ?? 0), page, pageSize };
 }
 
+export async function getOrderGroup(orderKey: string) {
+  await ensureSchema();
+  const db = sql();
+  const parsed = parseOrderKey(orderKey);
+
+  const rows =
+    parsed.type === "code"
+      ? await db`
+          select
+            'code:' || max(external_code) as order_key,
+            max(external_code) as external_code,
+            max(store_name) as store_name,
+            max(receiver_name) as receiver_name,
+            max(receiver_phone) as receiver_phone,
+            max(receiver_address) as receiver_address,
+            count(*)::int as sku_count,
+            coalesce(sum(quantity), 0)::text as total_quantity,
+            max(source_file) as source_file,
+            max(batch_id) as batch_id,
+            max(created_at) as created_at
+          from imported_orders
+          where external_code = ${parsed.externalCode}
+        `
+      : await db`
+          select
+            'row:' || max(id)::text as order_key,
+            max(external_code) as external_code,
+            max(store_name) as store_name,
+            max(receiver_name) as receiver_name,
+            max(receiver_phone) as receiver_phone,
+            max(receiver_address) as receiver_address,
+            count(*)::int as sku_count,
+            coalesce(sum(quantity), 0)::text as total_quantity,
+            max(source_file) as source_file,
+            max(batch_id) as batch_id,
+            max(created_at) as created_at
+          from imported_orders
+          where id = ${parsed.id}
+        `;
+
+  const row = rows[0];
+  if (!row?.order_key) throw new Error("运单不存在或已删除");
+  return row;
+}
+
+export async function listOrderItems(input: {
+  orderKey: string;
+  q?: string;
+  page?: number;
+  pageSize?: number;
+}) {
+  await ensureSchema();
+  const db = sql();
+  const parsed = parseOrderKey(input.orderKey);
+  const page = Math.max(input.page ?? 1, 1);
+  const pageSize = Math.min(Math.max(input.pageSize ?? 8, 3), 50);
+  const offset = (page - 1) * pageSize;
+  const q = input.q?.trim();
+  const like = q ? `%${q}%` : null;
+
+  const rows =
+    parsed.type === "code"
+      ? await db`
+          select id, sku_code, sku_name, quantity::text as quantity, spec, remark, created_at
+          from imported_orders
+          where external_code = ${parsed.externalCode}
+            and (${q || null}::text is null
+              or sku_code ilike ${like}
+              or sku_name ilike ${like}
+              or spec ilike ${like}
+              or remark ilike ${like})
+          order by id asc
+          limit ${pageSize} offset ${offset}
+        `
+      : await db`
+          select id, sku_code, sku_name, quantity::text as quantity, spec, remark, created_at
+          from imported_orders
+          where id = ${parsed.id}
+            and (${q || null}::text is null
+              or sku_code ilike ${like}
+              or sku_name ilike ${like}
+              or spec ilike ${like}
+              or remark ilike ${like})
+          order by id asc
+          limit ${pageSize} offset ${offset}
+        `;
+
+  const countRows =
+    parsed.type === "code"
+      ? await db`
+          select count(*)::int as total
+          from imported_orders
+          where external_code = ${parsed.externalCode}
+            and (${q || null}::text is null
+              or sku_code ilike ${like}
+              or sku_name ilike ${like}
+              or spec ilike ${like}
+              or remark ilike ${like})
+        `
+      : await db`
+          select count(*)::int as total
+          from imported_orders
+          where id = ${parsed.id}
+            and (${q || null}::text is null
+              or sku_code ilike ${like}
+              or sku_name ilike ${like}
+              or spec ilike ${like}
+              or remark ilike ${like})
+        `;
+
+  return { items: rows, total: Number(countRows[0]?.total ?? 0), page, pageSize };
+}
+
+export async function updateOrderGroupHeader(orderKey: string, input: OrderHeaderInput) {
+  await ensureSchema();
+  const db = sql();
+  const parsed = parseOrderKey(orderKey);
+  const externalCode = cleanNullable(input.externalCode);
+  const storeName = cleanNullable(input.storeName);
+  const receiverName = cleanNullable(input.receiverName);
+  const receiverPhone = cleanNullable(input.receiverPhone);
+  const receiverAddress = cleanNullable(input.receiverAddress);
+  const current = await getOrderGroup(orderKey);
+
+  if (!externalCode && Number(current.sku_count) > 1) {
+    throw new Error("多 SKU 运单必须保留外部编码，避免明细被拆散");
+  }
+
+  if (externalCode) {
+    const conflicts =
+      parsed.type === "code"
+        ? await db`
+            select id
+            from imported_orders
+            where external_code = ${externalCode}
+              and external_code <> ${parsed.externalCode}
+            limit 1
+          `
+        : await db`
+            select id
+            from imported_orders
+            where external_code = ${externalCode}
+              and id <> ${parsed.id}
+            limit 1
+          `;
+    if (conflicts.length) throw new Error("外部编码已被其他运单使用");
+  }
+
+  const updated =
+    parsed.type === "code"
+      ? await db`
+          update imported_orders
+          set external_code = ${externalCode},
+              store_name = ${storeName},
+              receiver_name = ${receiverName},
+              receiver_phone = ${receiverPhone},
+              receiver_address = ${receiverAddress}
+          where external_code = ${parsed.externalCode}
+          returning id
+        `
+      : await db`
+          update imported_orders
+          set external_code = ${externalCode},
+              store_name = ${storeName},
+              receiver_name = ${receiverName},
+              receiver_phone = ${receiverPhone},
+              receiver_address = ${receiverAddress}
+          where id = ${parsed.id}
+          returning id
+        `;
+
+  if (!updated.length) throw new Error("运单不存在或已删除");
+  const newOrderKey = externalCode ? `code:${externalCode}` : `row:${updated[0].id}`;
+  return getOrderGroup(newOrderKey);
+}
+
+export async function createOrderItem(orderKey: string, input: OrderItemInput) {
+  await ensureSchema();
+  const db = sql();
+  const order = await getOrderGroup(orderKey);
+  if (!order.external_code) {
+    throw new Error("请先为运单填写外部编码，再新增多 SKU 明细");
+  }
+  const item = normalizeItemInput(input);
+  const rows = await db`
+    insert into imported_orders (
+      external_code, store_name, receiver_name, receiver_phone, receiver_address,
+      sku_code, sku_name, quantity, spec, remark, source_file, batch_id
+    )
+    values (
+      ${order.external_code}, ${order.store_name}, ${order.receiver_name},
+      ${order.receiver_phone}, ${order.receiver_address}, ${item.skuCode},
+      ${item.skuName}, ${item.quantity}, ${item.spec}, ${item.remark},
+      ${order.source_file}, ${order.batch_id}
+    )
+    returning id, sku_code, sku_name, quantity::text as quantity, spec, remark, created_at
+  `;
+  return rows[0];
+}
+
+export async function updateOrderItem(id: number, input: OrderItemInput) {
+  await ensureSchema();
+  const db = sql();
+  const item = normalizeItemInput(input);
+  const rows = await db`
+    update imported_orders
+    set sku_code = ${item.skuCode},
+        sku_name = ${item.skuName},
+        quantity = ${item.quantity},
+        spec = ${item.spec},
+        remark = ${item.remark}
+    where id = ${id}
+    returning id, sku_code, sku_name, quantity::text as quantity, spec, remark, created_at
+  `;
+  if (!rows[0]) throw new Error("SKU 明细不存在或已删除");
+  return rows[0];
+}
+
+export async function deleteOrderItem(id: number) {
+  await ensureSchema();
+  const db = sql();
+  const rows = await db`
+    delete from imported_orders
+    where id = ${id}
+    returning id
+  `;
+  return { deleted: rows.length };
+}
+
 export async function deleteOrderGroup(orderKey: string) {
   await ensureSchema();
   const db = sql();
-  if (orderKey.startsWith("code:")) {
-    const externalCode = orderKey.slice("code:".length);
+  const parsed = parseOrderKey(orderKey);
+  if (parsed.type === "code") {
     const rows = await db`
       delete from imported_orders
-      where external_code = ${externalCode}
+      where external_code = ${parsed.externalCode}
       returning id
     `;
     return { deleted: rows.length };
+  }
+
+  const rows = await db`
+    delete from imported_orders
+    where id = ${parsed.id}
+    returning id
+  `;
+  return { deleted: rows.length };
+}
+
+function parseOrderKey(orderKey: string): ParsedOrderKey {
+  if (orderKey.startsWith("code:")) {
+    const externalCode = orderKey.slice("code:".length).trim();
+    if (!externalCode) throw new Error("无效的运单标识");
+    return { type: "code", externalCode };
   }
 
   if (orderKey.startsWith("row:")) {
     const id = Number(orderKey.slice("row:".length));
-    if (!Number.isFinite(id)) throw new Error("无效的运单标识");
-    const rows = await db`
-      delete from imported_orders
-      where id = ${id}
-      returning id
-    `;
-    return { deleted: rows.length };
+    if (!Number.isInteger(id) || id <= 0) throw new Error("无效的运单标识");
+    return { type: "row", id };
   }
 
   throw new Error("无效的运单标识");
+}
+
+function cleanNullable(value: string) {
+  const text = String(value ?? "").trim();
+  return text || null;
+}
+
+function normalizeItemInput(input: OrderItemInput) {
+  const skuCode = String(input.skuCode ?? "").trim();
+  const skuName = String(input.skuName ?? "").trim();
+  const quantity = Number(String(input.quantity ?? "").replace(/,/g, ""));
+  if (!skuCode) throw new Error("SKU 编码不能为空");
+  if (!skuName) throw new Error("SKU 名称不能为空");
+  if (!Number.isFinite(quantity) || quantity <= 0) throw new Error("发货数量必须为正数");
+  return {
+    skuCode,
+    skuName,
+    quantity,
+    spec: cleanNullable(input.spec),
+    remark: cleanNullable(input.remark)
+  };
 }

@@ -2,6 +2,8 @@
 
 import {
   AlertCircle,
+  Bell,
+  CalendarCheck,
   ChevronDown,
   ChevronRight,
   CheckCircle2,
@@ -10,11 +12,16 @@ import {
   Database,
   Download,
   FileSpreadsheet,
+  Folder,
   History,
+  Home,
   Loader2,
+  Menu,
   Plus,
   RefreshCw,
   Save,
+  Search,
+  Settings,
   Sparkles,
   Trash2,
   UploadCloud
@@ -24,15 +31,15 @@ import { BLANK_RULE } from "@/lib/default-rule";
 import { parseFileToSource, sampleSource, sourceStats } from "@/lib/client-file";
 import { parseWithRule } from "@/lib/rule-engine";
 import { FIELD_LABELS, FieldKey, OrderRow, ParsedSource, ParseRule, RuleRecord, ValidationIssue } from "@/lib/types";
-import { cn, toText } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { EDITABLE_FIELDS, emptyRow, issueMap, validateRows } from "@/lib/validation";
 
 type Toast = { type: "success" | "error" | "info"; text: string };
 
 type HistoryItem = {
   id: number;
-  sku_code: string;
-  sku_name: string;
+  skuCode: string;
+  skuName: string;
   quantity: string;
   spec: string | null;
   remark: string | null;
@@ -51,7 +58,32 @@ type HistoryOrder = {
   source_file: string | null;
   batch_id: string;
   created_at: string;
+};
+
+type HistoryHeaderDraft = {
+  externalCode: string;
+  storeName: string;
+  receiverName: string;
+  receiverPhone: string;
+  receiverAddress: string;
+};
+
+type HistoryItemDraft = {
+  skuCode: string;
+  skuName: string;
+  quantity: string;
+  spec: string;
+  remark: string;
+};
+
+type HistoryDetailState = {
   items: HistoryItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+  q: string;
+  header: HistoryHeaderDraft;
+  newItem: HistoryItemDraft;
 };
 
 const ROW_HEIGHT = 42;
@@ -81,6 +113,7 @@ export function ImporterApp() {
   });
   const [historyQuery, setHistoryQuery] = useState("");
   const [expandedHistory, setExpandedHistory] = useState<Set<string>>(new Set());
+  const [historyDetails, setHistoryDetails] = useState<Record<string, HistoryDetailState>>({});
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -126,8 +159,14 @@ export function ImporterApp() {
       const res = await fetch(`/api/orders?${params.toString()}`, { cache: "no-store" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "历史列表加载失败");
-      setHistory(data);
-      setExpandedHistory((current) => new Set([...current].filter((key) => (data.rows ?? []).some((row: HistoryOrder) => row.order_key === key))));
+      const nextRows = (data.rows ?? []) as HistoryOrder[];
+      const visibleKeys = new Set(nextRows.map((row) => row.order_key));
+      setHistory({ rows: nextRows, total: Number(data.total ?? 0), page: Number(data.page ?? page), pageSize: Number(data.pageSize ?? history.pageSize) });
+      setExpandedHistory((current) => new Set([...current].filter((key) => visibleKeys.has(key))));
+      setHistoryDetails((current) => {
+        const filtered = Object.entries(current).filter(([key]) => visibleKeys.has(key));
+        return Object.fromEntries(filtered) as Record<string, HistoryDetailState>;
+      });
     } catch (error) {
       showToast("error", getMessage(error));
     }
@@ -374,23 +413,235 @@ export function ImporterApp() {
     showToast("success", "Excel 已导出");
   }
 
-  function toggleHistory(orderKey: string) {
+  function toggleHistory(order: HistoryOrder) {
+    const orderKey = order.order_key;
+    const shouldOpen = !expandedHistory.has(orderKey);
     setExpandedHistory((current) => {
       const next = new Set(current);
       if (next.has(orderKey)) next.delete(orderKey);
       else next.add(orderKey);
       return next;
     });
+    if (shouldOpen) void loadHistoryItems(order, historyDetails[orderKey]?.page ?? 1, historyDetails[orderKey]?.q ?? "");
+  }
+
+  async function loadHistoryItems(orderOrKey: HistoryOrder | string, page = 1, q = "") {
+    const orderKey = typeof orderOrKey === "string" ? orderOrKey : orderOrKey.order_key;
+    const order = typeof orderOrKey === "string" ? history.rows.find((row) => row.order_key === orderKey) : orderOrKey;
+    const existing = historyDetails[orderKey];
+    const params = new URLSearchParams({ page: String(page), pageSize: String(existing?.pageSize ?? 8) });
+    if (q.trim()) params.set("q", q.trim());
+    setBusy(`history-items:${orderKey}`);
+    try {
+      const res = await fetch(`/api/orders/${orderKeyPath(orderKey)}/items?${params.toString()}`, { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "SKU 明细加载失败");
+      setHistoryDetails((current) => {
+        const currentDetail = current[orderKey];
+        return {
+          ...current,
+          [orderKey]: {
+            items: (data.items ?? []).map(normalizeHistoryItem),
+            total: Number(data.total ?? 0),
+            page: Number(data.page ?? page),
+            pageSize: Number(data.pageSize ?? currentDetail?.pageSize ?? 8),
+            q,
+            header: currentDetail?.header ?? (order ? historyHeaderFromOrder(order) : emptyHistoryHeader()),
+            newItem: currentDetail?.newItem ?? emptyHistoryItemDraft()
+          }
+        };
+      });
+    } catch (error) {
+      showToast("error", getMessage(error));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function updateHistoryHeaderField(orderKey: string, field: keyof HistoryHeaderDraft, value: string) {
+    setHistoryDetails((current) => {
+      const detail = current[orderKey];
+      if (!detail) return current;
+      return { ...current, [orderKey]: { ...detail, header: { ...detail.header, [field]: value } } };
+    });
+  }
+
+  function updateHistoryItemField(orderKey: string, itemId: number, field: keyof HistoryItemDraft, value: string) {
+    setHistoryDetails((current) => {
+      const detail = current[orderKey];
+      if (!detail) return current;
+      return {
+        ...current,
+        [orderKey]: {
+          ...detail,
+          items: detail.items.map((item) => (item.id === itemId ? { ...item, [field]: value } : item))
+        }
+      };
+    });
+  }
+
+  function updateNewHistoryItemField(orderKey: string, field: keyof HistoryItemDraft, value: string) {
+    setHistoryDetails((current) => {
+      const detail = current[orderKey];
+      if (!detail) return current;
+      return { ...current, [orderKey]: { ...detail, newItem: { ...detail.newItem, [field]: value } } };
+    });
+  }
+
+  function updateHistoryItemSearch(orderKey: string, q: string) {
+    setHistoryDetails((current) => {
+      const detail = current[orderKey];
+      if (!detail) return current;
+      return { ...current, [orderKey]: { ...detail, q } };
+    });
+  }
+
+  async function saveHistoryHeader(order: HistoryOrder) {
+    const detail = historyDetails[order.order_key];
+    if (!detail) return;
+    setBusy(`history-header:${order.order_key}`);
+    try {
+      const res = await fetch(`/api/orders/${orderKeyPath(order.order_key)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(detail.header)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "运单保存失败");
+      const updated = data.order as HistoryOrder;
+      setExpandedHistory((current) => {
+        const next = new Set(current);
+        next.delete(order.order_key);
+        next.add(updated.order_key);
+        return next;
+      });
+      setHistoryDetails((current) => {
+        const next = { ...current };
+        const currentDetail = next[order.order_key] ?? detail;
+        delete next[order.order_key];
+        next[updated.order_key] = { ...currentDetail, header: historyHeaderFromOrder(updated) };
+        return next;
+      });
+      showToast("success", "运单信息已保存");
+      await loadHistory(history.page);
+      await loadHistoryItems(updated, detail.page, detail.q);
+    } catch (error) {
+      showToast("error", getMessage(error));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function createHistoryItem(orderKey: string) {
+    const detail = historyDetails[orderKey];
+    if (!detail) return;
+    setBusy(`history-item-new:${orderKey}`);
+    try {
+      const res = await fetch(`/api/orders/${orderKeyPath(orderKey)}/items`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(detail.newItem)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "SKU 新增失败");
+      const nextPage = detail.q.trim() ? detail.page : Math.max(Math.ceil((detail.total + 1) / detail.pageSize), 1);
+      setHistoryDetails((current) => {
+        const currentDetail = current[orderKey];
+        if (!currentDetail) return current;
+        return { ...current, [orderKey]: { ...currentDetail, newItem: emptyHistoryItemDraft() } };
+      });
+      showToast("success", "SKU 明细已新增");
+      await loadHistory(history.page);
+      await loadHistoryItems(orderKey, nextPage, detail.q);
+    } catch (error) {
+      showToast("error", getMessage(error));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveHistoryItem(orderKey: string, item: HistoryItem) {
+    setBusy(`history-item:${item.id}`);
+    try {
+      const res = await fetch(`/api/order-items/${item.id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(item)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "SKU 保存失败");
+      const updated = normalizeHistoryItem(data.item);
+      setHistoryDetails((current) => {
+        const detail = current[orderKey];
+        if (!detail) return current;
+        return {
+          ...current,
+          [orderKey]: {
+            ...detail,
+            items: detail.items.map((row) => (row.id === updated.id ? updated : row))
+          }
+        };
+      });
+      showToast("success", "SKU 明细已保存");
+      await loadHistory(history.page);
+    } catch (error) {
+      showToast("error", getMessage(error));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteHistoryItem(orderKey: string, itemId: number) {
+    if (!window.confirm("确认删除这条 SKU 明细？")) return;
+    const detail = historyDetails[orderKey];
+    setBusy(`history-item-delete:${itemId}`);
+    try {
+      const res = await fetch(`/api/order-items/${itemId}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "SKU 删除失败");
+      showToast("success", `已删除 ${data.deleted ?? 0} 条 SKU 明细`);
+      if (!detail || detail.total <= 1) {
+        setExpandedHistory((current) => {
+          const next = new Set(current);
+          next.delete(orderKey);
+          return next;
+        });
+        setHistoryDetails((current) => {
+          const next = { ...current };
+          delete next[orderKey];
+          return next;
+        });
+        await loadHistory(history.page);
+        return;
+      }
+      const nextPage = detail.items.length <= 1 && detail.page > 1 ? detail.page - 1 : detail.page;
+      await loadHistory(history.page);
+      await loadHistoryItems(orderKey, nextPage, detail.q);
+    } catch (error) {
+      showToast("error", getMessage(error));
+    } finally {
+      setBusy("");
+    }
   }
 
   async function deleteHistoryOrder(orderKey: string) {
     if (!window.confirm("确认删除这张运单及其全部 SKU 明细？")) return;
     setBusy(`history-delete:${orderKey}`);
     try {
-      const res = await fetch(`/api/orders?orderKey=${encodeURIComponent(orderKey)}`, { method: "DELETE" });
+      const res = await fetch(`/api/orders/${orderKeyPath(orderKey)}`, { method: "DELETE" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "删除失败");
       showToast("success", `已删除 ${data.deleted ?? 0} 条 SKU 明细`);
+      setExpandedHistory((current) => {
+        const next = new Set(current);
+        next.delete(orderKey);
+        return next;
+      });
+      setHistoryDetails((current) => {
+        const next = { ...current };
+        delete next[orderKey];
+        return next;
+      });
       await loadHistory(history.page);
     } catch (error) {
       showToast("error", getMessage(error));
@@ -423,8 +674,291 @@ export function ImporterApp() {
   }, [scrollTop, rows.length]);
   const visibleRows = rows.slice(visibleRange.start, visibleRange.end);
 
+  function renderHistoryDetail(row: HistoryOrder) {
+    const detail = historyDetails[row.order_key];
+    const pageTotal = Math.max(Math.ceil((detail?.total ?? 0) / (detail?.pageSize ?? 8)), 1);
+
+    return (
+      <tr className="history-detail-row" key={`${row.order_key}:items`}>
+        <td colSpan={8}>
+          <div className="history-detail">
+            {!detail || busy === `history-items:${row.order_key}` ? (
+              <div className="history-loading">
+                <Loader2 className="spin" size={18} />
+                正在加载 SKU 明细
+              </div>
+            ) : (
+              <>
+                <div className="history-header-editor">
+                  <label>
+                    外部编码
+                    <input value={detail.header.externalCode} onChange={(event) => updateHistoryHeaderField(row.order_key, "externalCode", event.target.value)} />
+                  </label>
+                  <label>
+                    收货门店
+                    <input value={detail.header.storeName} onChange={(event) => updateHistoryHeaderField(row.order_key, "storeName", event.target.value)} />
+                  </label>
+                  <label>
+                    收件人
+                    <input value={detail.header.receiverName} onChange={(event) => updateHistoryHeaderField(row.order_key, "receiverName", event.target.value)} />
+                  </label>
+                  <label>
+                    电话
+                    <input value={detail.header.receiverPhone} onChange={(event) => updateHistoryHeaderField(row.order_key, "receiverPhone", event.target.value)} />
+                  </label>
+                  <label className="wide">
+                    收货地址
+                    <input value={detail.header.receiverAddress} onChange={(event) => updateHistoryHeaderField(row.order_key, "receiverAddress", event.target.value)} />
+                  </label>
+                  <button className="soft-button" disabled={Boolean(busy)} onClick={() => saveHistoryHeader(row)}>
+                    {busy === `history-header:${row.order_key}` ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+                    保存运单
+                  </button>
+                </div>
+
+                <div className="history-detail-meta">
+                  <span>批次：{row.batch_id}</span>
+                  <span>源文件：{row.source_file || "-"}</span>
+                  <span>SKU 总数：{detail.total}</span>
+                </div>
+
+                <form
+                  className="history-item-toolbar"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void loadHistoryItems(row.order_key, 1, detail.q);
+                  }}
+                >
+                  <input
+                    placeholder="搜索 SKU 编码、名称、规格、备注"
+                    value={detail.q}
+                    onChange={(event) => updateHistoryItemSearch(row.order_key, event.target.value)}
+                  />
+                  <button className="soft-button" type="submit">
+                    查询
+                  </button>
+                  <span>
+                    第 {detail.page} / {pageTotal} 页
+                  </span>
+                </form>
+
+                <div className="history-detail-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>SKU编码</th>
+                        <th>SKU名称</th>
+                        <th>规格</th>
+                        <th>数量</th>
+                        <th>备注</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {detail.items.map((item) => (
+                        <tr key={item.id}>
+                          <td>
+                            <input value={item.skuCode} onChange={(event) => updateHistoryItemField(row.order_key, item.id, "skuCode", event.target.value)} />
+                          </td>
+                          <td>
+                            <input value={item.skuName} onChange={(event) => updateHistoryItemField(row.order_key, item.id, "skuName", event.target.value)} />
+                          </td>
+                          <td>
+                            <input value={item.spec ?? ""} onChange={(event) => updateHistoryItemField(row.order_key, item.id, "spec", event.target.value)} />
+                          </td>
+                          <td>
+                            <input value={item.quantity} onChange={(event) => updateHistoryItemField(row.order_key, item.id, "quantity", event.target.value)} />
+                          </td>
+                          <td>
+                            <input value={item.remark ?? ""} onChange={(event) => updateHistoryItemField(row.order_key, item.id, "remark", event.target.value)} />
+                          </td>
+                          <td>
+                            <div className="row-actions">
+                              <button className="icon-button" title="保存 SKU" disabled={Boolean(busy)} onClick={() => saveHistoryItem(row.order_key, item)}>
+                                {busy === `history-item:${item.id}` ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                              </button>
+                              <button
+                                className="icon-button danger"
+                                title="删除 SKU"
+                                disabled={Boolean(busy)}
+                                onClick={() => deleteHistoryItem(row.order_key, item.id)}
+                              >
+                                {busy === `history-item-delete:${item.id}` ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                      <tr className="new-item-row">
+                        <td>
+                          <input
+                            placeholder="新增编码"
+                            value={detail.newItem.skuCode}
+                            onChange={(event) => updateNewHistoryItemField(row.order_key, "skuCode", event.target.value)}
+                          />
+                        </td>
+                        <td>
+                          <input
+                            placeholder="新增名称"
+                            value={detail.newItem.skuName}
+                            onChange={(event) => updateNewHistoryItemField(row.order_key, "skuName", event.target.value)}
+                          />
+                        </td>
+                        <td>
+                          <input value={detail.newItem.spec} onChange={(event) => updateNewHistoryItemField(row.order_key, "spec", event.target.value)} />
+                        </td>
+                        <td>
+                          <input value={detail.newItem.quantity} onChange={(event) => updateNewHistoryItemField(row.order_key, "quantity", event.target.value)} />
+                        </td>
+                        <td>
+                          <input value={detail.newItem.remark} onChange={(event) => updateNewHistoryItemField(row.order_key, "remark", event.target.value)} />
+                        </td>
+                        <td>
+                          <button className="soft-button" disabled={Boolean(busy)} onClick={() => createHistoryItem(row.order_key)}>
+                            {busy === `history-item-new:${row.order_key}` ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+                            新增
+                          </button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="pager detail-pager">
+                  <span>
+                    共 {detail.total} 条 SKU，第 {detail.page} / {pageTotal} 页
+                  </span>
+                  <button className="soft-button" disabled={detail.page <= 1} onClick={() => loadHistoryItems(row.order_key, detail.page - 1, detail.q)}>
+                    上一页
+                  </button>
+                  <button className="soft-button" disabled={detail.page >= pageTotal} onClick={() => loadHistoryItems(row.order_key, detail.page + 1, detail.q)}>
+                    下一页
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
   return (
-    <main className="app-shell">
+    <div className="zt-frame">
+      <header className="zt-navbar">
+        <div className="zt-brand">
+          <div className="zt-logo">ZTO</div>
+          <div className="zt-brand-text">
+            <strong>中通冷链</strong>
+            <span>ZTO COLD CHAIN</span>
+          </div>
+        </div>
+        <nav className="zt-product-tabs" aria-label="业务系统">
+          <button>冷链智运</button>
+          <button className="active">冷链快运</button>
+        </nav>
+        <div className="zt-nav-actions">
+          <span>返回旧版</span>
+          <span>快件跟踪</span>
+          <span className="with-badge">
+            <CalendarCheck size={15} />
+            待办
+            <b>27</b>
+          </span>
+          <span className="with-badge">
+            <Bell size={15} />
+            消息
+            <b>99+</b>
+          </span>
+          <span>导出</span>
+          <span>下载</span>
+          <span>工单</span>
+          <span>反馈</span>
+          <span>喜喜</span>
+          <Settings size={17} />
+        </div>
+      </header>
+
+      <div className="zt-layout">
+        <aside className="zt-sidebar">
+          <div className="zt-org">
+            <Menu size={18} />
+            <span>总部</span>
+            <ChevronDown size={16} />
+          </div>
+          <label className="zt-menu-search">
+            <Search size={17} />
+            <input placeholder="输入菜单名称" readOnly />
+          </label>
+          <nav className="zt-menu" aria-label="主菜单">
+            <a>
+              <Home size={19} />
+              首页
+            </a>
+            <a>
+              <Folder size={19} />
+              PDA操作管理
+            </a>
+            <a>
+              <ClipboardCheck size={19} />
+              OMS订单中心
+            </a>
+            <a>
+              <Folder size={19} />
+              基础管理
+            </a>
+            <a>
+              <RefreshCw size={19} />
+              仓链重构
+            </a>
+            <a>
+              <Folder size={19} />
+              工作台
+            </a>
+            <a className="active">
+              <Folder size={19} />
+              经营管理中心
+            </a>
+            <a>
+              <Folder size={19} />
+              冷链财务管理
+            </a>
+            <a>
+              <Folder size={19} />
+              数据预警
+            </a>
+            <a>
+              <Download size={19} />
+              中通冷链业务员APP
+            </a>
+          </nav>
+          <div className="zt-env-switch">
+            <span>预发环境</span>
+            <i />
+          </div>
+          <nav className="zt-menu zt-menu-bottom" aria-label="辅助菜单">
+            <a>
+              <Folder size={19} />
+              仓储中心
+            </a>
+            <a>
+              <Folder size={19} />
+              测试二级目录2
+            </a>
+          </nav>
+        </aside>
+
+        <section className="zt-content">
+          <div className="zt-content-tabs">
+            <button className="zt-collapse">《</button>
+            <div className="zt-tab-active">订单管理 <span>×</span></div>
+            <div className="zt-tab-tools">
+              <RefreshCw size={17} />
+              <ChevronDown size={18} />
+            </div>
+          </div>
+
+          <main className="app-shell">
       <section className="topbar">
         <div>
           <div className="eyebrow">智能多格式批量下单系统 V2</div>
@@ -683,7 +1217,7 @@ export function ImporterApp() {
                 <Fragment key={row.order_key}>
                   <tr key={row.order_key}>
                     <td>
-                      <button className="history-expand" onClick={() => toggleHistory(row.order_key)} title="查看 SKU 明细">
+                      <button className="history-expand" onClick={() => toggleHistory(row)} title="查看 SKU 明细">
                         {expandedHistory.has(row.order_key) ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                         <span>{row.external_code || "无外部编码"}</span>
                       </button>
@@ -708,40 +1242,7 @@ export function ImporterApp() {
                       </button>
                     </td>
                   </tr>
-                  {expandedHistory.has(row.order_key) && (
-                    <tr className="history-detail-row" key={`${row.order_key}:items`}>
-                      <td colSpan={8}>
-                        <div className="history-detail">
-                          <div className="history-detail-meta">
-                            <span>收货地址：{row.receiver_address || "-"}</span>
-                            <span>批次：{row.batch_id}</span>
-                          </div>
-                          <table>
-                            <thead>
-                              <tr>
-                                <th>SKU编码</th>
-                                <th>SKU名称</th>
-                                <th>规格</th>
-                                <th>数量</th>
-                                <th>备注</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {row.items.map((item) => (
-                                <tr key={item.id}>
-                                  <td>{item.sku_code}</td>
-                                  <td>{item.sku_name}</td>
-                                  <td>{item.spec || "-"}</td>
-                                  <td>{item.quantity}</td>
-                                  <td>{item.remark || "-"}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </td>
-                    </tr>
-                  )}
+                  {expandedHistory.has(row.order_key) && renderHistoryDetail(row)}
                 </Fragment>
               ))}
               {!history.rows.length && (
@@ -771,8 +1272,12 @@ export function ImporterApp() {
         </div>
       </section>
 
+          </main>
+        </section>
+      </div>
+
       {toast && <div className={cn("toast", toast.type)}>{toast.text}</div>}
-    </main>
+    </div>
   );
 }
 
@@ -792,6 +1297,52 @@ function StatusPill({ label, value, tone }: { label: string; value: string; tone
       <strong>{value}</strong>
     </div>
   );
+}
+
+function orderKeyPath(orderKey: string) {
+  return encodeURIComponent(orderKey);
+}
+
+function emptyHistoryHeader(): HistoryHeaderDraft {
+  return {
+    externalCode: "",
+    storeName: "",
+    receiverName: "",
+    receiverPhone: "",
+    receiverAddress: ""
+  };
+}
+
+function emptyHistoryItemDraft(): HistoryItemDraft {
+  return {
+    skuCode: "",
+    skuName: "",
+    quantity: "1",
+    spec: "",
+    remark: ""
+  };
+}
+
+function historyHeaderFromOrder(order: HistoryOrder): HistoryHeaderDraft {
+  return {
+    externalCode: order.external_code ?? "",
+    storeName: order.store_name ?? "",
+    receiverName: order.receiver_name ?? "",
+    receiverPhone: order.receiver_phone ?? "",
+    receiverAddress: order.receiver_address ?? ""
+  };
+}
+
+function normalizeHistoryItem(input: Record<string, unknown>): HistoryItem {
+  return {
+    id: Number(input.id),
+    skuCode: String(input.skuCode ?? input.sku_code ?? ""),
+    skuName: String(input.skuName ?? input.sku_name ?? ""),
+    quantity: String(input.quantity ?? ""),
+    spec: input.spec == null ? null : String(input.spec),
+    remark: input.remark == null ? null : String(input.remark),
+    created_at: String(input.created_at ?? "")
+  };
 }
 
 function getMessage(error: unknown) {
