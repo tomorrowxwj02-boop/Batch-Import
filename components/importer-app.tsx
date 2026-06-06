@@ -26,7 +26,7 @@ import { ChangeEvent, DragEvent, Fragment, KeyboardEvent, useEffect, useMemo, us
 import { BLANK_RULE } from "@/lib/default-rule";
 import { parseFileToSource, sampleSource, sourceStats } from "@/lib/client-file";
 import { parseWithRule } from "@/lib/rule-engine";
-import { FIELD_LABELS, FieldKey, OrderRow, ParsedSource, ParseRule, RuleRecord, ValidationIssue } from "@/lib/types";
+import { ColumnSelector, FIELD_LABELS, FieldKey, OrderRow, ParsedSource, ParseRule, ParseStrategy, RuleRecord, ValidationIssue } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { EDITABLE_FIELDS, emptyRow, issueMap, validateRows } from "@/lib/validation";
 
@@ -85,6 +85,25 @@ type HistoryDetailState = {
 
 const ROW_HEIGHT = 42;
 const PREVIEW_HEIGHT = 484;
+const STRATEGY_OPTIONS: Array<{ type: ParseStrategy["type"]; label: string; caption: string }> = [
+  { type: "table", label: "普通表格", caption: "一张明细表，表头下方就是 SKU 行" },
+  { type: "matrix", label: "横向门店表", caption: "门店在横向列里，单元格里填写数量" },
+  { type: "cards", label: "卡片式单据", caption: "一个文件里有多张小单，每张小单都有明细表" },
+  { type: "textSegments", label: "文本/PDF", caption: "按文本段落和行内容提取 SKU" }
+];
+const RULE_FIELDS: FieldKey[] = ["externalCode", "storeName", "receiverName", "receiverPhone", "receiverAddress", "skuCode", "skuName", "quantity", "spec", "remark"];
+const FIELD_HINTS: Partial<Record<FieldKey, string>> = {
+  externalCode: "同一外部编码下可以有多条 SKU",
+  storeName: "门店列、机构列或横向门店列",
+  receiverName: "收货联系人姓名",
+  receiverPhone: "手机或固定电话",
+  receiverAddress: "收货地址字段",
+  skuCode: "商品编码、物品编码等",
+  skuName: "商品名称、物品名称等",
+  quantity: "发货数量、出库数量等",
+  spec: "规格型号可为空",
+  remark: "备注可为空"
+};
 
 export function ImporterApp() {
   const [activePage, setActivePage] = useState<ActivePage>("import");
@@ -101,6 +120,7 @@ export function ImporterApp() {
   const [busy, setBusy] = useState("");
   const [toast, setToast] = useState<Toast | null>(null);
   const [aiNotes, setAiNotes] = useState<string[]>([]);
+  const [showAdvancedRule, setShowAdvancedRule] = useState(false);
   const [metrics, setMetrics] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
   const [history, setHistory] = useState<{ rows: HistoryOrder[]; total: number; page: number; pageSize: number }>({
@@ -153,11 +173,11 @@ export function ImporterApp() {
       const res = await fetch("/api/rules", { cache: "no-store" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "规则加载失败");
-      setRules(data.rules ?? []);
-      if (data.rules?.[0]) {
-        setSelectedRuleId(String(data.rules[0].id));
-        setRuleDraft(data.rules[0].rule);
-        setRuleText(JSON.stringify(data.rules[0].rule, null, 2));
+      const nextRules = (data.rules ?? []) as RuleRecord[];
+      setRules(nextRules);
+      if (!selectedRuleId && nextRules[0]) {
+        setSelectedRuleId(String(nextRules[0].id));
+        applyRuleDraft(nextRules[0].rule);
       }
     } catch (error) {
       showToast("error", getMessage(error));
@@ -215,8 +235,7 @@ export function ImporterApp() {
     setSelectedRuleId(id);
     const selected = rules.find((rule) => String(rule.id) === id);
     if (selected) {
-      setRuleDraft(selected.rule);
-      setRuleText(JSON.stringify(selected.rule, null, 2));
+      applyRuleDraft(selected.rule);
     }
   }
 
@@ -224,7 +243,7 @@ export function ImporterApp() {
     try {
       const parsed = JSON.parse(ruleText) as ParseRule;
       if (!parsed.name || !Array.isArray(parsed.strategies)) throw new Error("规则至少需要 name 和 strategies");
-      setRuleDraft(parsed);
+      applyRuleDraft(parsed);
       return parsed;
     } catch (error) {
       showToast("error", `规则 JSON 不合法：${getMessage(error)}`);
@@ -246,8 +265,7 @@ export function ImporterApp() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "AI 生成规则失败");
-      setRuleDraft(data.rule);
-      setRuleText(JSON.stringify(data.rule, null, 2));
+      applyRuleDraft(data.rule);
       setAiNotes(data.notes ?? []);
       setSelectedRuleId("");
       setActivePage("rules");
@@ -318,8 +336,13 @@ export function ImporterApp() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "规则保存失败");
-      await loadRules();
+      setRules((current) => {
+        const saved = data.rule as RuleRecord;
+        const exists = current.some((rule) => rule.id === saved.id);
+        return exists ? current.map((rule) => (rule.id === saved.id ? saved : rule)) : [saved, ...current];
+      });
       setSelectedRuleId(String(data.rule.id));
+      applyRuleDraft(data.rule.rule);
       showToast("success", "规则已保存到数据库");
     } catch (error) {
       showToast("error", getMessage(error));
@@ -336,8 +359,7 @@ export function ImporterApp() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "规则删除失败");
       setSelectedRuleId("");
-      setRuleDraft(BLANK_RULE);
-      setRuleText(JSON.stringify(BLANK_RULE, null, 2));
+      applyRuleDraft(BLANK_RULE);
       await loadRules();
       showToast("success", "规则已删除");
     } catch (error) {
@@ -352,17 +374,103 @@ export function ImporterApp() {
     if (!rule) return;
     const copied = { ...rule, name: `${rule.name} 副本` };
     setSelectedRuleId("");
-    setRuleDraft(copied);
-    setRuleText(JSON.stringify(copied, null, 2));
+    applyRuleDraft(copied);
     showToast("info", "已复制为新规则草案");
   }
 
   function newRule() {
     const rule = { ...BLANK_RULE, name: fileName ? `${fileName} 解析规则` : "新解析规则" };
     setSelectedRuleId("");
+    applyRuleDraft(rule);
+    setAiNotes([]);
+  }
+
+  function applyRuleDraft(rule: ParseRule) {
     setRuleDraft(rule);
     setRuleText(JSON.stringify(rule, null, 2));
-    setAiNotes([]);
+  }
+
+  function updateRuleDraft(updater: (rule: ParseRule) => ParseRule) {
+    applyRuleDraft(updater(ruleDraft));
+  }
+
+  function updateRuleField<K extends keyof Pick<ParseRule, "name" | "description" | "source" | "sheetMode">>(field: K, value: ParseRule[K]) {
+    updateRuleDraft((rule) => ({ ...rule, [field]: value }));
+  }
+
+  function updatePrimaryStrategy(updater: (strategy: ParseStrategy) => ParseStrategy) {
+    updateRuleDraft((rule) => {
+      const current = rule.strategies[0] ?? createStrategyForType("table");
+      return { ...rule, strategies: [updater(current), ...rule.strategies.slice(1)] };
+    });
+  }
+
+  function changePrimaryStrategy(type: ParseStrategy["type"]) {
+    updatePrimaryStrategy((strategy) => createStrategyForType(type, strategy));
+  }
+
+  function updateHeaderKeywords(value: string) {
+    const keywords = splitRuleInput(value);
+    updatePrimaryStrategy((strategy) => {
+      if (strategy.type === "table") return { ...strategy, header: { ...strategy.header, findByKeywords: keywords } };
+      if (strategy.type === "matrix") return { ...strategy, header: { ...(strategy.header ?? {}), findByKeywords: keywords } };
+      if (strategy.type === "cards") return { ...strategy, tableHeader: { ...(strategy.tableHeader ?? {}), findByKeywords: keywords } };
+      return strategy;
+    });
+  }
+
+  function updateFieldCandidates(field: FieldKey, value: string) {
+    const selector = selectorFromText(value);
+    updatePrimaryStrategy((strategy) => {
+      if (strategy.type === "table") return { ...strategy, columns: setColumnSelector(strategy.columns, field, selector) };
+      if (strategy.type === "matrix") return { ...strategy, rowFields: setColumnSelector(strategy.rowFields ?? strategy.columns, field, selector) };
+      if (strategy.type === "cards") return { ...strategy, columns: setColumnSelector(strategy.columns, field, selector) };
+      return strategy;
+    });
+  }
+
+  function updateMatrixBoundary(kind: "startAfterCandidates" | "endBeforeCandidates", value: string) {
+    updatePrimaryStrategy((strategy) => {
+      if (strategy.type !== "matrix") return strategy;
+      return {
+        ...strategy,
+        pivot: {
+          ...strategy.pivot,
+          columns: {
+            ...(strategy.pivot.columns ?? {}),
+            [kind]: splitRuleInput(value)
+          }
+        }
+      };
+    });
+  }
+
+  function updateMatrixPivotField(field: FieldKey) {
+    updatePrimaryStrategy((strategy) => {
+      if (strategy.type !== "matrix") return strategy;
+      return { ...strategy, pivot: { ...strategy.pivot, field } };
+    });
+  }
+
+  function updateMatrixCellMode(mode: "quantity" | "items") {
+    updatePrimaryStrategy((strategy) => {
+      if (strategy.type !== "matrix") return strategy;
+      return { ...strategy, cell: { ...strategy.cell, mode } };
+    });
+  }
+
+  function updateCardBoundary(value: string) {
+    updatePrimaryStrategy((strategy) => {
+      if (strategy.type !== "cards") return strategy;
+      return { ...strategy, boundary: { ...(strategy.boundary ?? {}), pattern: value } };
+    });
+  }
+
+  function updateTextStrategy(field: "segmentBoundary" | "itemLinePattern", value: string) {
+    updatePrimaryStrategy((strategy) => {
+      if (strategy.type !== "textSegments") return strategy;
+      return { ...strategy, [field]: value };
+    });
   }
 
   function updateCell(rowId: string, field: FieldKey, value: string) {
@@ -687,6 +795,9 @@ export function ImporterApp() {
     return { start, end: Math.min(start + visible, rows.length) };
   }, [scrollTop, rows.length]);
   const visibleRows = rows.slice(visibleRange.start, visibleRange.end);
+  const primaryStrategy = ruleDraft.strategies[0] ?? createStrategyForType("table");
+  const currentPageSkuCount = history.rows.reduce((sum, row) => sum + Number(row.sku_count ?? 0), 0);
+  const currentPageQuantity = history.rows.reduce((sum, row) => sum + Number(row.total_quantity ?? 0), 0);
 
   function renderHistoryDetail(row: HistoryOrder) {
     const detail = historyDetails[row.order_key];
@@ -1135,6 +1246,24 @@ export function ImporterApp() {
             </button>
           </form>
         </div>
+        <div className="history-summary">
+          <div className="history-summary-card primary">
+            <span>已导入运单</span>
+            <strong>{history.total}</strong>
+          </div>
+          <div className="history-summary-card">
+            <span>当前页运单</span>
+            <strong>{history.rows.length}</strong>
+          </div>
+          <div className="history-summary-card">
+            <span>当前页 SKU</span>
+            <strong>{currentPageSkuCount}</strong>
+          </div>
+          <div className="history-summary-card">
+            <span>当前页数量</span>
+            <strong>{formatQuantity(currentPageQuantity)}</strong>
+          </div>
+        </div>
         <div className="history-table-wrap">
           <table className="history-table">
             <thead>
@@ -1152,22 +1281,26 @@ export function ImporterApp() {
             <tbody>
               {history.rows.map((row) => (
                 <Fragment key={row.order_key}>
-                  <tr key={row.order_key}>
+                  <tr className="history-row" key={row.order_key}>
                     <td>
                       <button className="history-expand" onClick={() => toggleHistory(row)} title="查看 SKU 明细">
                         {expandedHistory.has(row.order_key) ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                        <span>{row.external_code || "无外部编码"}</span>
+                        <span className="order-code-pill">{row.external_code || "无外部编码"}</span>
                       </button>
                     </td>
                     <td>{row.store_name || "-"}</td>
                     <td>{row.receiver_name || "-"}</td>
                     <td>{row.receiver_phone || "-"}</td>
                     <td>
-                      <strong>{row.sku_count} 条 SKU</strong>
-                      <span>{row.source_file || row.batch_id}</span>
+                      <span className="history-sku-badge">{row.sku_count} 条 SKU</span>
+                      <span className="history-source">{row.source_file || row.batch_id}</span>
                     </td>
-                    <td>{row.total_quantity}</td>
-                    <td>{new Date(row.created_at).toLocaleString("zh-CN")}</td>
+                    <td>
+                      <span className="history-quantity-badge">{formatQuantity(Number(row.total_quantity ?? 0))}</span>
+                    </td>
+                    <td>
+                      <span className="history-time">{new Date(row.created_at).toLocaleString("zh-CN")}</span>
+                    </td>
                     <td>
                       <button
                         className="icon-button danger"
@@ -1255,16 +1388,228 @@ export function ImporterApp() {
               </div>
             )}
 
-            <textarea
-              className="rule-editor rule-editor-large"
-              spellCheck={false}
-              value={ruleText}
-              onChange={(event) => setRuleText(event.target.value)}
-              onBlur={() => {
-                const parsed = parseRuleText();
-                if (parsed) setRuleDraft(parsed);
-              }}
-            />
+            <div className="rule-form">
+              <section className="rule-section">
+                <div className="rule-section-head">
+                  <div>
+                    <strong>规则基本信息</strong>
+                    <span>给这套解析方式起一个客户能看懂的名字</span>
+                  </div>
+                </div>
+                <div className="rule-basic-grid">
+                  <label>
+                    规则名称
+                    <input value={ruleDraft.name} onChange={(event) => updateRuleField("name", event.target.value)} />
+                  </label>
+                  <label>
+                    文件类型
+                    <select value={ruleDraft.source} onChange={(event) => updateRuleField("source", event.target.value as ParseRule["source"])}>
+                      <option value="any">自动识别</option>
+                      <option value="workbook">Excel 表格</option>
+                      <option value="text">Word/PDF 文本</option>
+                    </select>
+                  </label>
+                  <label>
+                    Sheet 范围
+                    <select value={ruleDraft.sheetMode ?? "all"} onChange={(event) => updateRuleField("sheetMode", event.target.value as ParseRule["sheetMode"])}>
+                      <option value="all">全部 Sheet</option>
+                      <option value="first">仅第一个 Sheet</option>
+                    </select>
+                  </label>
+                  <label className="wide">
+                    规则说明
+                    <input
+                      placeholder="例如：欢乐牧场横向门店调拨单"
+                      value={ruleDraft.description ?? ""}
+                      onChange={(event) => updateRuleField("description", event.target.value)}
+                    />
+                  </label>
+                </div>
+              </section>
+
+              <section className="rule-section">
+                <div className="rule-section-head">
+                  <div>
+                    <strong>单据结构</strong>
+                    <span>选择这份客户文件最接近的版式</span>
+                  </div>
+                </div>
+                <div className="rule-type-grid">
+                  {STRATEGY_OPTIONS.map((option) => (
+                    <button
+                      className={cn("rule-type-card", primaryStrategy.type === option.type && "active")}
+                      key={option.type}
+                      type="button"
+                      onClick={() => changePrimaryStrategy(option.type)}
+                    >
+                      <strong>{option.label}</strong>
+                      <span>{option.caption}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              {primaryStrategy.type !== "textSegments" && (
+                <>
+                  <section className="rule-section">
+                    <div className="rule-section-head">
+                      <div>
+                        <strong>定位表头</strong>
+                        <span>填写客户文件里常出现的表头词，系统会用它找到明细开始位置</span>
+                      </div>
+                    </div>
+                    <label className="rule-wide-label">
+                      表头关键词
+                      <input
+                        placeholder="编码、名称、数量"
+                        value={headerKeywordsText(primaryStrategy)}
+                        onChange={(event) => updateHeaderKeywords(event.target.value)}
+                      />
+                    </label>
+                  </section>
+
+                  <section className="rule-section">
+                    <div className="rule-section-head">
+                      <div>
+                        <strong>字段对应关系</strong>
+                        <span>每行填写客户文件中可能出现的列名，多个名称用逗号分隔</span>
+                      </div>
+                    </div>
+                    <div className="field-map-grid">
+                      {RULE_FIELDS.map((field) => (
+                        <label className="field-map-row" key={field}>
+                          <span>
+                            <strong>{FIELD_LABELS[field]}</strong>
+                            <em>{FIELD_HINTS[field]}</em>
+                          </span>
+                          <input
+                            placeholder="填写可能的列名，多个用逗号分隔"
+                            value={fieldCandidatesText(primaryStrategy, field)}
+                            onChange={(event) => updateFieldCandidates(field, event.target.value)}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  </section>
+                </>
+              )}
+
+              {primaryStrategy.type === "matrix" && (
+                <section className="rule-section">
+                  <div className="rule-section-head">
+                    <div>
+                      <strong>横向门店规则</strong>
+                      <span>用于一个外部编码/SKU 行对应多个横向门店数量的单据</span>
+                    </div>
+                  </div>
+                  <div className="rule-basic-grid">
+                    <label>
+                      横向列代表
+                      <select value={primaryStrategy.pivot.field} onChange={(event) => updateMatrixPivotField(event.target.value as FieldKey)}>
+                        <option value="storeName">收货门店</option>
+                        <option value="externalCode">外部编码</option>
+                        <option value="remark">备注</option>
+                      </select>
+                    </label>
+                    <label>
+                      单元格内容
+                      <select value={primaryStrategy.cell.mode ?? "quantity"} onChange={(event) => updateMatrixCellMode(event.target.value as "quantity" | "items")}>
+                        <option value="quantity">数量</option>
+                        <option value="items">SKU 明细文本</option>
+                      </select>
+                    </label>
+                    <label>
+                      从这些列之后开始
+                      <input
+                        placeholder="规格、备注、合计"
+                        value={matrixBoundaryText(primaryStrategy, "startAfterCandidates")}
+                        onChange={(event) => updateMatrixBoundary("startAfterCandidates", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      到这些列之前结束
+                      <input
+                        placeholder="合计、总计、备注"
+                        value={matrixBoundaryText(primaryStrategy, "endBeforeCandidates")}
+                        onChange={(event) => updateMatrixBoundary("endBeforeCandidates", event.target.value)}
+                      />
+                    </label>
+                  </div>
+                </section>
+              )}
+
+              {primaryStrategy.type === "cards" && (
+                <section className="rule-section">
+                  <div className="rule-section-head">
+                    <div>
+                      <strong>卡片分隔规则</strong>
+                      <span>用于一个文件里有多张小单，每张小单各自带 SKU 明细的模板</span>
+                    </div>
+                  </div>
+                  <label className="rule-wide-label">
+                    每张小单的开始标记
+                    <input
+                      placeholder="例如：记录#\\d+、调入门店、收货门店"
+                      value={primaryStrategy.boundary?.pattern ?? ""}
+                      onChange={(event) => updateCardBoundary(event.target.value)}
+                    />
+                  </label>
+                </section>
+              )}
+
+              {primaryStrategy.type === "textSegments" && (
+                <section className="rule-section">
+                  <div className="rule-section-head">
+                    <div>
+                      <strong>文本提取规则</strong>
+                      <span>适合 Word/PDF 文本，按段落和行内容提取 SKU</span>
+                    </div>
+                  </div>
+                  <div className="rule-basic-grid">
+                    <label>
+                      分段标记
+                      <input
+                        placeholder="留空时按大段空行拆分"
+                        value={primaryStrategy.segmentBoundary ?? ""}
+                        onChange={(event) => updateTextStrategy("segmentBoundary", event.target.value)}
+                      />
+                    </label>
+                    <label className="wide">
+                      SKU 行匹配规则
+                      <input
+                        placeholder="带 skuCode、skuName、quantity 分组的正则"
+                        value={primaryStrategy.itemLinePattern}
+                        onChange={(event) => updateTextStrategy("itemLinePattern", event.target.value)}
+                      />
+                    </label>
+                  </div>
+                </section>
+              )}
+
+              <section className="rule-section advanced-rule-panel">
+                <div className="rule-section-head">
+                  <div>
+                    <strong>专业规则 JSON</strong>
+                    <span>复杂模板或 AI 生成规则可在这里微调</span>
+                  </div>
+                  <button className="soft-button" type="button" onClick={() => setShowAdvancedRule((value) => !value)}>
+                    {showAdvancedRule ? "收起 JSON" : "展开 JSON"}
+                  </button>
+                </div>
+                {showAdvancedRule && (
+                  <textarea
+                    className="rule-editor"
+                    spellCheck={false}
+                    value={ruleText}
+                    onChange={(event) => setRuleText(event.target.value)}
+                    onBlur={() => {
+                      const parsed = parseRuleText();
+                      if (parsed) applyRuleDraft(parsed);
+                    }}
+                  />
+                )}
+              </section>
+            </div>
           </section>
         </section>
       )}
@@ -1294,6 +1639,133 @@ function StatusPill({ label, value, tone }: { label: string; value: string; tone
       <strong>{value}</strong>
     </div>
   );
+}
+
+function createStrategyForType(type: ParseStrategy["type"], existing?: ParseStrategy): ParseStrategy {
+  const columns = strategyColumns(existing);
+  const keywords = strategyHeaderKeywords(existing);
+  const base = {
+    enabled: existing?.enabled ?? true,
+    sheets: existing?.sheets ?? "all",
+    common: existing?.common,
+    defaults: existing?.defaults
+  };
+
+  if (type === "matrix") {
+    return {
+      ...base,
+      type: "matrix",
+      header: { findByKeywords: keywords.length ? keywords : ["编码", "名称", "数量"], maxScanRows: 30 },
+      dataStartRowOffset: 1,
+      rowFields: columns,
+      pivot: {
+        field: existing?.type === "matrix" ? existing.pivot.field : "storeName",
+        columns:
+          existing?.type === "matrix"
+            ? existing.pivot.columns
+            : { startAfterCandidates: ["规格", "备注"], endBeforeCandidates: ["合计", "总计"] }
+      },
+      cell: existing?.type === "matrix" ? existing.cell : { mode: "quantity" }
+    };
+  }
+
+  if (type === "cards") {
+    return {
+      ...base,
+      type: "cards",
+      boundary: existing?.type === "cards" ? existing.boundary : { pattern: "记录[#＃]?\\d+|调入门店|收货门店" },
+      tableHeader: {
+        findByKeywords: keywords.length ? keywords : ["物品编码", "物品名称", "数量"],
+        ...(existing?.type === "cards" ? existing.tableHeader : {})
+      },
+      columns
+    };
+  }
+
+  if (type === "textSegments") {
+    return {
+      ...base,
+      type: "textSegments",
+      segmentBoundary: existing?.type === "textSegments" ? existing.segmentBoundary : "",
+      itemLinePattern:
+        existing?.type === "textSegments"
+          ? existing.itemLinePattern
+          : "(?<skuCode>\\S+)\\s+(?<skuName>.+?)\\s+(?<quantity>\\d+(?:\\.\\d+)?)"
+    };
+  }
+
+  return {
+    ...base,
+    type: "table",
+    header: { findByKeywords: keywords.length ? keywords : ["编码", "名称", "数量"], maxScanRows: 20 },
+    dataStartRowOffset: 1,
+    columns,
+    skipRowsWhen: existing?.type === "table" ? existing.skipRowsWhen : { textMatches: ["合计", "总计"], requiredAny: ["skuCode", "skuName", "quantity"] }
+  };
+}
+
+function splitRuleInput(value: string) {
+  return value
+    .split(/[,，、\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function selectorFromText(value: string): ColumnSelector {
+  return { candidates: splitRuleInput(value) };
+}
+
+function setColumnSelector(
+  columns: Partial<Record<FieldKey, ColumnSelector>> | undefined,
+  field: FieldKey,
+  selector: ColumnSelector
+) {
+  const next = { ...(columns ?? {}) };
+  if (selector.candidates?.length || selector.header || selector.index !== undefined) next[field] = selector;
+  else delete next[field];
+  return next;
+}
+
+function headerKeywordsText(strategy: ParseStrategy) {
+  return strategyHeaderKeywords(strategy).join("，");
+}
+
+function fieldCandidatesText(strategy: ParseStrategy, field: FieldKey) {
+  const selector = strategyColumns(strategy)[field];
+  return selectorText(selector);
+}
+
+function matrixBoundaryText(
+  strategy: Extract<ParseStrategy, { type: "matrix" }>,
+  kind: "startAfterCandidates" | "endBeforeCandidates"
+) {
+  return (strategy.pivot.columns?.[kind] ?? []).join("，");
+}
+
+function strategyHeaderKeywords(strategy?: ParseStrategy) {
+  if (!strategy) return [];
+  if (strategy.type === "table") return strategy.header.findByKeywords ?? [];
+  if (strategy.type === "matrix") return strategy.header?.findByKeywords ?? [];
+  if (strategy.type === "cards") return strategy.tableHeader?.findByKeywords ?? [];
+  return [];
+}
+
+function strategyColumns(strategy?: ParseStrategy): Partial<Record<FieldKey, ColumnSelector>> {
+  if (!strategy) return {};
+  if (strategy.type === "table") return strategy.columns;
+  if (strategy.type === "matrix") return strategy.rowFields ?? strategy.columns ?? {};
+  if (strategy.type === "cards") return strategy.columns ?? {};
+  return {};
+}
+
+function selectorText(selector?: ColumnSelector) {
+  if (!selector) return "";
+  return [selector.header, ...(selector.candidates ?? [])].filter(Boolean).join("，");
+}
+
+function formatQuantity(value: number) {
+  if (!Number.isFinite(value)) return "0";
+  return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.?0+$/, "");
 }
 
 function pageFromHash(hash: string): ActivePage {

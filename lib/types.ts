@@ -77,6 +77,8 @@ export type StopRule = {
   emptyColumn?: ColumnSelector;
 };
 
+export type HeaderLocator = { rowIndex?: number; findByKeywords?: string[]; maxScanRows?: number; rowStart?: number; rowEnd?: number };
+
 export type BaseStrategy = {
   id?: string;
   enabled?: boolean;
@@ -87,7 +89,7 @@ export type BaseStrategy = {
 
 export type TableStrategy = BaseStrategy & {
   type: "table";
-  header: { rowIndex?: number; findByKeywords?: string[]; maxScanRows?: number };
+  header: HeaderLocator;
   dataStartRowOffset?: number;
   columns: Partial<Record<FieldKey, ColumnSelector>>;
   stopWhen?: StopRule;
@@ -97,29 +99,45 @@ export type TableStrategy = BaseStrategy & {
 
 export type MatrixStrategy = BaseStrategy & {
   type: "matrix";
-  headerRow: number;
-  dataStartRow: number;
-  rowFields: Partial<Record<FieldKey, ColumnSelector>>;
+  headerRow?: number;
+  dataStartRow?: number;
+  header?: HeaderLocator;
+  dataStartRowOffset?: number;
+  rowFields?: Partial<Record<FieldKey, ColumnSelector>>;
+  columns?: Partial<Record<FieldKey, ColumnSelector>>;
   pivot: {
     headerRow?: number;
-    startColumn: number;
+    startColumn?: number;
     endColumn?: number;
     field: FieldKey;
     valuePrefix?: string;
+    columns?: {
+      startAfter?: ColumnSelector;
+      endBefore?: ColumnSelector;
+      startAfterCandidates?: string[];
+      endBeforeCandidates?: string[];
+      excludeCandidates?: string[];
+    };
+    headerSource?: string;
+    headerValue?: boolean;
   };
   cell: {
-    mode: "quantity" | "items";
+    mode?: "quantity" | "items";
     quantityField?: FieldKey;
     itemPattern?: string;
+    emitWhen?: "positive";
+    skipEmpty?: boolean;
+    skipZero?: boolean;
+    field?: FieldKey;
   };
   stopWhen?: StopRule;
 };
 
 export type CardStrategy = BaseStrategy & {
   type: "cards";
-  boundary: { pattern: string; column?: number };
-  tableHeader: { findByKeywords?: string[]; offsetFromBoundary?: number; maxRows?: number };
-  columns: Partial<Record<FieldKey, ColumnSelector>>;
+  boundary?: { pattern?: string; column?: number };
+  tableHeader?: { findByKeywords?: string[]; offsetFromBoundary?: number; maxRows?: number };
+  columns?: Partial<Record<FieldKey, ColumnSelector>>;
   cardCommon?: Partial<Record<FieldKey, Extractor>>;
 };
 
