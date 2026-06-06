@@ -32,6 +32,7 @@ import { EDITABLE_FIELDS, emptyRow, issueMap, validateRows } from "@/lib/validat
 
 type Toast = { type: "success" | "error" | "info"; text: string };
 type ActivePage = "import" | "rules";
+type ProgressState = { percent: number; label: string; current?: number; total?: number };
 
 type HistoryItem = {
   id: number;
@@ -116,7 +117,7 @@ export function ImporterApp() {
   const [rows, setRows] = useState<OrderRow[]>([]);
   const [existingCodes, setExistingCodes] = useState<Set<string>>(new Set());
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
-  const [progress, setProgress] = useState({ percent: 0, label: "等待上传" });
+  const [progress, setProgress] = useState<ProgressState>({ percent: 0, label: "等待上传" });
   const [busy, setBusy] = useState("");
   const [toast, setToast] = useState<Toast | null>(null);
   const [aiNotes, setAiNotes] = useState<string[]>([]);
@@ -130,6 +131,8 @@ export function ImporterApp() {
     pageSize: 12
   });
   const [historyQuery, setHistoryQuery] = useState("");
+  const [historyDateFrom, setHistoryDateFrom] = useState("");
+  const [historyDateTo, setHistoryDateTo] = useState("");
   const [expandedHistory, setExpandedHistory] = useState<Set<string>>(new Set());
   const [historyDetails, setHistoryDetails] = useState<Record<string, HistoryDetailState>>({});
 
@@ -184,10 +187,12 @@ export function ImporterApp() {
     }
   }
 
-  async function loadHistory(page = history.page, q = historyQuery) {
+  async function loadHistory(page = history.page, q = historyQuery, dateFrom = historyDateFrom, dateTo = historyDateTo) {
     try {
       const params = new URLSearchParams({ page: String(page), pageSize: String(history.pageSize) });
       if (q.trim()) params.set("q", q.trim());
+      if (dateFrom) params.set("dateFrom", dateStartParam(dateFrom));
+      if (dateTo) params.set("dateTo", dateEndParam(dateTo));
       const res = await fetch(`/api/orders?${params.toString()}`, { cache: "no-store" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "历史列表加载失败");
@@ -204,6 +209,13 @@ export function ImporterApp() {
     }
   }
 
+  function resetHistoryFilters() {
+    setHistoryQuery("");
+    setHistoryDateFrom("");
+    setHistoryDateTo("");
+    void loadHistory(1, "", "", "");
+  }
+
   async function handleFiles(files: FileList | File[]) {
     const file = files[0];
     if (!file) return;
@@ -213,13 +225,19 @@ export function ImporterApp() {
     setAiNotes([]);
     setFileName(file.name);
     try {
-      const parsed = await parseFileToSource(file, (percent, label) => setProgress({ percent, label }));
+      const parsed = await parseFileToSource(file, (percent, label, current, total) => setProgress({ percent, label, current, total }));
       setSource(parsed);
-      setProgress({ percent: 100, label: "文件已就绪，选择规则或生成新规则" });
+      const parsedStats = sourceStats(parsed);
+      setProgress({
+        percent: 100,
+        label: `文件已就绪：已读取 ${parsedStats.rows}/${parsedStats.rows} 源行`,
+        current: parsedStats.rows,
+        total: parsedStats.rows
+      });
       showToast("success", "文件解析为统一样本完成");
     } catch (error) {
       setSource(null);
-      setProgress({ percent: 0, label: "解析失败" });
+      setProgress({ percent: 0, label: "解析失败", current: 0, total: 0 });
       showToast("error", getMessage(error));
     } finally {
       setBusy("");
@@ -286,13 +304,15 @@ export function ImporterApp() {
     const rule = parseRuleText();
     if (!rule) return;
     setBusy("parse");
+    const total = sourceStats(source).rows;
+    setProgress({ percent: 72, label: `正在应用解析规则：0/${total} 源行`, current: 0, total });
     window.setTimeout(async () => {
       try {
         const result = parseWithRule(source, rule);
         setRows(result.rows);
         setMetrics(`解析 ${result.rows.length} 行，用时 ${result.metrics.durationMs}ms，策略 ${result.metrics.strategies} 个`);
         await checkDuplicates(result.rows);
-        setProgress({ percent: 100, label: `试解析完成：${result.rows.length} 行` });
+        setProgress({ percent: 100, label: `试解析完成：源数据 ${total}/${total}，生成 ${result.rows.length} 行`, current: total, total });
         if (result.rows.length) showToast("success", "试解析完成，可继续编辑或提交");
         else showToast("error", "规则未解析出数据，请调整映射后重试");
       } catch (error) {
@@ -497,6 +517,7 @@ export function ImporterApp() {
       return;
     }
     setBusy("submit");
+    setProgress({ percent: 82, label: `正在提交下单：0/${rows.length} 条 SKU`, current: 0, total: rows.length });
     try {
       const res = await fetch("/api/orders", {
         method: "POST",
@@ -505,6 +526,12 @@ export function ImporterApp() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "提交失败");
+      setProgress({
+        percent: 100,
+        label: `提交完成：成功 ${data.success}/${rows.length} 条 SKU，失败 ${data.failed?.length ?? 0} 条`,
+        current: Number(data.success ?? 0),
+        total: rows.length
+      });
       showToast("success", `提交完成：成功 ${data.success} 条 SKU，生成 ${data.orderCount ?? "-"} 张运单，失败 ${data.failed?.length ?? 0} 条`);
       await loadHistory(1);
       await checkDuplicates(rows);
@@ -1054,11 +1081,16 @@ export function ImporterApp() {
             {item}
           </div>
         ))}
-        <div className="progress-track" aria-label={progress.label}>
-          <div style={{ width: `${progress.percent}%` }} />
-        </div>
-        <strong>{progress.percent}%</strong>
-        <em>{progress.label}</em>
+          <div className="progress-track" aria-label={progress.label}>
+            <div style={{ width: `${progress.percent}%` }} />
+          </div>
+          <strong>{progress.percent}%</strong>
+          <em>
+            {progress.label}
+            {typeof progress.current === "number" && typeof progress.total === "number" && progress.total > 0 ? (
+              <span className="progress-count">处理 {progress.current}/{progress.total}</span>
+            ) : null}
+          </em>
       </section>
 
       <section className="workspace-grid">
@@ -1233,7 +1265,7 @@ export function ImporterApp() {
             className="history-search"
             onSubmit={(event) => {
               event.preventDefault();
-              void loadHistory(1, historyQuery);
+              void loadHistory(1, historyQuery, historyDateFrom, historyDateTo);
             }}
           >
             <input
@@ -1241,8 +1273,19 @@ export function ImporterApp() {
               value={historyQuery}
               onChange={(event) => setHistoryQuery(event.target.value)}
             />
+            <label>
+              <span>提交开始</span>
+              <input type="date" value={historyDateFrom} onChange={(event) => setHistoryDateFrom(event.target.value)} />
+            </label>
+            <label>
+              <span>提交结束</span>
+              <input type="date" value={historyDateTo} onChange={(event) => setHistoryDateTo(event.target.value)} />
+            </label>
             <button className="soft-button" type="submit">
               查询
+            </button>
+            <button className="soft-button" type="button" onClick={resetHistoryFilters}>
+              重置
             </button>
           </form>
         </div>
@@ -1373,10 +1416,22 @@ export function ImporterApp() {
                 {busy === "ai" ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
                 AI 生成规则
               </button>
+              <button className="soft-button" disabled={!source || Boolean(busy)} onClick={previewParse}>
+                {busy === "parse" ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+                试解析确认
+              </button>
               <button className="soft-button" disabled={Boolean(busy)} onClick={saveRule}>
                 {busy === "save-rule" ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
                 保存
               </button>
+            </div>
+
+            <div className="rule-confirm-box">
+              <CheckCircle2 size={17} />
+              <div>
+                <strong>保存前确认流程</strong>
+                <span>AI 只生成规则草案，需先用当前样例试解析、人工确认字段映射后再保存生效。</span>
+              </div>
             </div>
 
             {!!aiNotes.length && (
@@ -1770,6 +1825,14 @@ function formatQuantity(value: number) {
 
 function pageFromHash(hash: string): ActivePage {
   return hash === "#rules" ? "rules" : "import";
+}
+
+function dateStartParam(date: string) {
+  return `${date}T00:00:00.000+08:00`;
+}
+
+function dateEndParam(date: string) {
+  return `${date}T23:59:59.999+08:00`;
 }
 
 function orderKeyPath(orderKey: string) {

@@ -145,6 +145,7 @@ const NON_ITEM_KEYWORDS = [
   "调拨数量"
 ];
 const TEXT_ITEM_CODE_PATTERN = "[A-Za-z]{1,12}[A-Za-z0-9_-]*\\d[A-Za-z0-9_-]*";
+const TEXT_LOOSE_ITEM_CODE_PATTERN = "[A-Za-z0-9][A-Za-z0-9_-]{1,63}";
 const TEXT_LABEL_BOUNDARIES = [
   "单据编号",
   "单据号",
@@ -478,16 +479,33 @@ function parseCardSheet(
 }
 
 function parseAutoTextSource(source: TextSource, rule: ParseRule) {
-  const text = source.text.replace(/\s+/g, " ").trim();
-  const common = {
+  const wholeCommon = buildAutoTextCommon(source.text, rule);
+  const rows: RowObject[] = [];
+  const segments = splitAutoTextSegments(source.text);
+
+  segments.forEach((segment, segmentIndex) => {
+    const common = buildAutoTextCommon(segment, rule, wholeCommon);
+    rows.push(...parseAutoTextSegment(segment, common, segmentIndex));
+  });
+
+  return dedupeTextRows(rows);
+}
+
+function buildAutoTextCommon(text: string, rule: ParseRule, fallback: Partial<Record<FieldKey, string>> = {}) {
+  return {
     ...rule.defaults,
-    ...evaluateTextCommon(source.text, rule.common),
-    externalCode: extractTextLabel(source.text, ["单据编号", "单据号", "配送单号", "订单号", "调拨单号"]) || rule.defaults?.externalCode || "",
-    storeName: extractTextLabel(source.text, ["收货机构", "收货门店", "调入门店", "门店"]) || rule.defaults?.storeName || "",
-    receiverName: extractTextLabel(source.text, ["收货人", "收件人", "联系人"]) || rule.defaults?.receiverName || "",
-    receiverPhone: extractTextLabel(source.text, ["收货电话", "联系电话", "电话", "手机"]) || rule.defaults?.receiverPhone || "",
-    receiverAddress: extractTextLabel(source.text, ["收货地址", "地址"]) || rule.defaults?.receiverAddress || ""
+    ...fallback,
+    ...evaluateTextCommon(text, rule.common),
+    externalCode: extractTextLabel(text, ["单据编号", "单据号", "配送单号", "订单号", "调拨单号"]) || fallback.externalCode || rule.defaults?.externalCode || "",
+    storeName: extractTextLabel(text, ["收货机构", "收货门店", "调入门店", "门店"]) || fallback.storeName || rule.defaults?.storeName || "",
+    receiverName: extractTextLabel(text, ["收货人", "收件人", "联系人"]) || fallback.receiverName || rule.defaults?.receiverName || "",
+    receiverPhone: extractTextLabel(text, ["收货电话", "联系电话", "电话", "手机"]) || fallback.receiverPhone || rule.defaults?.receiverPhone || "",
+    receiverAddress: extractTextLabel(text, ["收货地址", "地址"]) || fallback.receiverAddress || rule.defaults?.receiverAddress || ""
   };
+}
+
+function parseAutoTextSegment(segment: string, common: Partial<Record<FieldKey, string>>, segmentIndex: number) {
+  const text = segment.replace(/\s+/g, " ").trim();
   const rows: RowObject[] = [];
   const itemRe = new RegExp(
     `(?:^|\\s)(?<lineNo>\\d{1,4})\\s+(?<category>[^\\s]+)\\s+(?<skuCode>${TEXT_ITEM_CODE_PATTERN})\\s*(?<detail>[\\s\\S]*?)(?=\\s+\\d{1,4}\\s+[^\\s]+\\s+${TEXT_ITEM_CODE_PATTERN}|\\s+合\\s*计|\\s+物品类别|\\s+第\\d+页|$)`,
@@ -503,6 +521,7 @@ function parseAutoTextSource(source: TextSource, rule: ParseRule) {
     const item = splitNameAndSpec(itemText);
     const record: RowObject = {
       ...common,
+      externalCode: common.externalCode || `TXT-${segmentIndex + 1}`,
       skuCode: toText(match.groups?.skuCode),
       skuName: item.name,
       spec: item.spec,
@@ -513,7 +532,107 @@ function parseAutoTextSource(source: TextSource, rule: ParseRule) {
     if (isLikelyItemRecord(record)) rows.push(record);
   }
 
+  segment
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .forEach((line, lineIndex) => {
+      const item = parseTextItemLine(line);
+      if (!item) return;
+      const record: RowObject = {
+        ...common,
+        externalCode: common.externalCode || `TXT-${segmentIndex + 1}`,
+        ...item,
+        sourceSheet: "文本/PDF",
+        sourceRow: lineIndex + 1
+      };
+      if (isLikelyItemRecord(record)) rows.push(record);
+    });
+
   return rows;
+}
+
+function splitAutoTextSegments(text: string) {
+  const normalized = text.replace(/\r/g, "\n");
+  const withTitleBreaks = normalized.replace(
+    /\n\s*((?:配送签收单|门店配送确认单|配送确认单|出库单|调拨单|发货单|配送单)[^\n]{0,40})\s*\n/g,
+    "\n<<<AUTO_SEGMENT>>>$1\n"
+  );
+  const parts = withTitleBreaks
+    .split(/\n\s*(?:<<<AUTO_SEGMENT>>>|[-_—=]{4,}|━{3,}|─{3,}|---\s*PAGE\s*---)\s*\n/gi)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 10);
+
+  return parts.length ? parts : [normalized.trim()].filter(Boolean);
+}
+
+function parseTextItemLine(line: string): Partial<Record<FieldKey, string>> | null {
+  const text = toText(line.replace(/\s+/g, " "));
+  if (!text || /^(合计|总计|小计|物品编码|sku编码|编码\s*[|｜]\s*名称)/i.test(normalizeText(text))) return null;
+
+  const delimited = text.match(
+    new RegExp(
+      `^(?:\\d+\\s*[.、)]\\s*)?(?<skuCode>${TEXT_LOOSE_ITEM_CODE_PATTERN})\\s*[|｜]\\s*(?<skuName>[^|｜]+?)\\s*(?:[|｜]\\s*(?<spec>[^|｜]*?))?\\s*[|｜]\\s*(?<quantity>\\d+(?:,\\d{3})*(?:\\.\\d+)?)`,
+      "i"
+    )
+  );
+  if (delimited?.groups) {
+    return {
+      skuCode: delimited.groups.skuCode,
+      skuName: delimited.groups.skuName,
+      spec: delimited.groups.spec ?? "",
+      quantity: normalizeQuantity(delimited.groups.quantity)
+    };
+  }
+
+  const labeled = parseLabeledTextItemLine(text);
+  if (labeled) return labeled;
+
+  const loose = text.match(
+    new RegExp(
+      `^(?:\\d+\\s*[.、)]\\s*)?(?<skuCode>${TEXT_LOOSE_ITEM_CODE_PATTERN})\\s+(?<detail>.+?)\\s+(?<quantity>\\d+(?:,\\d{3})*(?:\\.\\d+)?)(?:\\s*(?:件|箱|包|瓶|袋|个|盒|桶))?$`,
+      "i"
+    )
+  );
+  if (!loose?.groups) return null;
+  const item = splitNameAndSpec(loose.groups.detail);
+  return {
+    skuCode: loose.groups.skuCode,
+    skuName: item.name,
+    spec: item.spec,
+    quantity: normalizeQuantity(loose.groups.quantity)
+  };
+}
+
+function parseLabeledTextItemLine(text: string): Partial<Record<FieldKey, string>> | null {
+  const skuCode = extractInlineAnyLabel(text, ["SKU编码", "SKU", "物品编码", "商品编码", "编码"]);
+  const skuName = extractInlineAnyLabel(text, ["SKU名称", "物品名称", "商品名称", "名称"]);
+  const quantity = extractInlineAnyLabel(text, ["发货数量", "出库数量", "数量"]);
+  if (!skuCode || !skuName || !quantity) return null;
+  return {
+    skuCode,
+    skuName,
+    spec: extractInlineAnyLabel(text, ["规格型号", "规格", "型号"]),
+    quantity: normalizeQuantity(quantity)
+  };
+}
+
+function extractInlineAnyLabel(text: string, labels: string[]) {
+  for (const label of labels) {
+    const value = extractTextLabel(text, [label]);
+    if (value) return value;
+  }
+  return "";
+}
+
+function dedupeTextRows(rows: RowObject[]) {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    const key = [row.externalCode, row.skuCode, row.skuName, row.quantity].map(toText).join("::");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function parseTextStrategy(source: TextSource, rule: ParseRule, strategy: Extract<ParseStrategy, { type: "textSegments" }>) {

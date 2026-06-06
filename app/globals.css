@@ -465,9 +465,26 @@ h1 {
 }
 
 .flow-card em {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
   color: var(--muted);
   font-size: 13px;
   font-style: normal;
+}
+
+.progress-count {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid #c9eeee;
+  border-radius: 999px;
+  background: #f1fbfb;
+  color: var(--primary-dark);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .workspace-grid {
@@ -693,9 +710,42 @@ select:focus,
 
 .rule-config-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) auto auto;
+  grid-template-columns: minmax(260px, 1fr) auto auto auto;
   gap: 10px;
   align-items: center;
+}
+
+.rule-confirm-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  border: 1px solid #bfebdf;
+  border-radius: 8px;
+  background: #f0fbf6;
+  color: #126342;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
+.rule-confirm-box svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--ok);
+}
+
+.rule-confirm-box div {
+  display: grid;
+  gap: 3px;
+}
+
+.rule-confirm-box strong {
+  color: #0f6f48;
+}
+
+.rule-confirm-box span {
+  color: #3f6f5c;
+  line-height: 1.45;
 }
 
 .rule-editor-large {
@@ -977,10 +1027,28 @@ select:focus,
 
 .history-search {
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
-.history-search input {
-  width: min(360px, 42vw);
+.history-search > input {
+  width: min(300px, 34vw);
+}
+
+.history-search label {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.history-search label span {
+  line-height: 1;
+}
+
+.history-search label input {
+  width: 142px;
 }
 
 .history-summary {

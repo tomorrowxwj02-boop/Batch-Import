@@ -3,7 +3,9 @@
 import { ParsedSource } from "@/lib/types";
 import { toText } from "@/lib/utils";
 
-export async function parseFileToSource(file: File, onProgress?: (percent: number, label: string) => void): Promise<ParsedSource> {
+type ProgressCallback = (percent: number, label: string, current?: number, total?: number) => void;
+
+export async function parseFileToSource(file: File, onProgress?: ProgressCallback): Promise<ParsedSource> {
   const ext = file.name.split(".").pop()?.toLowerCase();
   onProgress?.(8, "读取文件");
   if (ext === "xlsx" || ext === "xls") return parseExcel(file, onProgress);
@@ -12,13 +14,13 @@ export async function parseFileToSource(file: File, onProgress?: (percent: numbe
   throw new Error("仅支持 .xlsx/.xls/.docx/.pdf 文件");
 }
 
-async function parseExcel(file: File, onProgress?: (percent: number, label: string) => void): Promise<ParsedSource> {
+async function parseExcel(file: File, onProgress?: ProgressCallback): Promise<ParsedSource> {
   const XLSX = await import("xlsx");
   const buffer = await file.arrayBuffer();
   onProgress?.(35, "解析工作簿");
   const workbook = XLSX.read(buffer, { type: "array", cellDates: false, dense: true });
   const sheets = workbook.SheetNames.map((name, index) => {
-    onProgress?.(35 + Math.round(((index + 1) / workbook.SheetNames.length) * 45), `读取 Sheet：${name}`);
+    onProgress?.(35 + Math.round(((index + 1) / workbook.SheetNames.length) * 45), `读取 Sheet：${name}`, index + 1, workbook.SheetNames.length);
     const sheet = workbook.Sheets[name];
     const rows = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
       header: 1,
@@ -32,22 +34,24 @@ async function parseExcel(file: File, onProgress?: (percent: number, label: stri
     };
   });
   if (!sheets.length || sheets.every((sheet) => sheet.rows.length === 0)) throw new Error("文件为空，未读取到有效工作表");
-  onProgress?.(100, "工作簿解析完成");
+  const totalRows = sheets.reduce((sum, sheet) => sum + sheet.rows.length, 0);
+  onProgress?.(100, `工作簿解析完成：${totalRows}/${totalRows} 源行`, totalRows, totalRows);
   return { kind: "workbook", fileName: file.name, sheets };
 }
 
-async function parseDocx(file: File, onProgress?: (percent: number, label: string) => void): Promise<ParsedSource> {
+async function parseDocx(file: File, onProgress?: ProgressCallback): Promise<ParsedSource> {
   const mammoth = await import("mammoth/mammoth.browser");
   const buffer = await file.arrayBuffer();
   onProgress?.(45, "提取 Word 文本");
   const result = await mammoth.extractRawText({ arrayBuffer: buffer });
   const text = result.value.trim();
   if (!text) throw new Error("Word 文件未提取到可解析文本");
-  onProgress?.(100, "Word 文本解析完成");
+  const lines = text.split(/\n+/).filter(Boolean).length;
+  onProgress?.(100, `Word 文本解析完成：${lines}/${lines} 段`, lines, lines);
   return { kind: "text", fileName: file.name, text };
 }
 
-async function parsePdf(file: File, onProgress?: (percent: number, label: string) => void): Promise<ParsedSource> {
+async function parsePdf(file: File, onProgress?: ProgressCallback): Promise<ParsedSource> {
   const pdfjs = await import("pdfjs-dist/legacy/webpack.mjs");
   const data = new Uint8Array(await file.arrayBuffer());
   onProgress?.(35, "读取 PDF");
@@ -55,7 +59,7 @@ async function parsePdf(file: File, onProgress?: (percent: number, label: string
   const pdf = await loadingTask.promise;
   const pages: string[] = [];
   for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
-    onProgress?.(35 + Math.round((pageNo / pdf.numPages) * 55), `提取 PDF 第 ${pageNo}/${pdf.numPages} 页`);
+    onProgress?.(35 + Math.round((pageNo / pdf.numPages) * 55), `提取 PDF 第 ${pageNo}/${pdf.numPages} 页`, pageNo, pdf.numPages);
     const page = await pdf.getPage(pageNo);
     const content = await page.getTextContent();
     const text = content.items.map((item) => ("str" in item ? toText(item.str) : "")).join(" ");
@@ -63,7 +67,7 @@ async function parsePdf(file: File, onProgress?: (percent: number, label: string
   }
   const text = pages.join("\n\n--- PAGE ---\n\n").trim();
   if (!text) throw new Error("PDF 未提取到可解析文本，可能是扫描件");
-  onProgress?.(100, "PDF 文本解析完成");
+  onProgress?.(100, `PDF 文本解析完成：${pdf.numPages}/${pdf.numPages} 页`, pdf.numPages, pdf.numPages);
   return { kind: "text", fileName: file.name, text, pages };
 }
 
