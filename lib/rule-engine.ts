@@ -280,7 +280,10 @@ function parseTableSheet(
 
   const header = sheet.rows[headerIndex] ?? [];
   const dataStart = headerIndex + (strategy.dataStartRowOffset ?? 1);
-  const common = collectCommon(sheet, rule, strategy, undefined);
+  const common = {
+    ...inferSheetCommon(sheet),
+    ...collectCommon(sheet, rule, strategy, undefined)
+  };
   const rows: RowObject[] = [];
   const columns = normalizeColumns(strategy.columns, DEFAULT_ITEM_COLUMNS);
   let dataStarted = false;
@@ -677,6 +680,22 @@ function inferCardCommon(sheet: SheetContext, cardRows: CellValue[][], absoluteS
   };
 }
 
+function inferSheetCommon(sheet: SheetContext): Partial<Record<FieldKey, string>> {
+  return {
+    externalCode: extractLabeledValue(sheet.rows, ["外部编码", "配送单号", "订单号", "调拨单号", "单据号", "单号"]),
+    storeName: extractLabeledValue(sheet.rows, ["收货门店", "调入门店", "收货机构", "门店", "机构"]) || inferStoreNameFromSheet(sheet.name),
+    receiverName: extractLabeledValue(sheet.rows, ["收货人", "收件人", "联系人"]),
+    receiverPhone: extractLabeledValue(sheet.rows, ["联系电话", "收货电话", "电话", "手机"]),
+    receiverAddress: extractLabeledValue(sheet.rows, ["收货地址", "地址"])
+  };
+}
+
+function inferStoreNameFromSheet(name: string) {
+  const text = toText(name);
+  if (!text || /^(sheet\d*|查询结果|调拨单|明细|数据)$/i.test(text)) return "";
+  return text;
+}
+
 function extractCardMarker(rows: CellValue[][]) {
   const text = rows
     .slice(0, 3)
@@ -810,7 +829,10 @@ function materializeRecord(input: {
     const selector = input.columns[field];
     if (!selector) return;
     const columnIndex = resolveColumn(selector, input.header);
-    if (columnIndex >= 0) record[field] = toText(input.row[columnIndex]);
+    if (columnIndex >= 0) {
+      const value = toText(input.row[columnIndex]);
+      if (value || !toText(record[field])) record[field] = value;
+    }
   });
   return record;
 }
