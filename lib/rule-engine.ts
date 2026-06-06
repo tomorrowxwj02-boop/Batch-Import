@@ -101,6 +101,81 @@ const MATRIX_EXCLUDED_HEADER_KEYWORDS = [
   "合计",
   "总计"
 ];
+const DETAIL_STOP_KEYWORDS = [
+  "合计",
+  "总计",
+  "小计",
+  "单据号",
+  "单据编号",
+  "上游单据",
+  "创建日期",
+  "创建人",
+  "制单日期",
+  "制单人",
+  "审核人",
+  "发货人",
+  "收货人",
+  "收货电话",
+  "备用联系人",
+  "备用联系电话",
+  "收货地址",
+  "收货机构备注",
+  "收货人签字",
+  "联系人",
+  "联系电话",
+  "签字",
+  "打印次数",
+  "备注"
+];
+const NON_ITEM_KEYWORDS = [
+  ...DETAIL_STOP_KEYWORDS,
+  "调入门店",
+  "收货门店",
+  "调拨记录",
+  "物品编码",
+  "商品编码",
+  "sku编码",
+  "sku条码",
+  "物品名称",
+  "商品名称",
+  "sku名称",
+  "规格型号",
+  "发货数量",
+  "出库数量",
+  "调拨数量"
+];
+const TEXT_ITEM_CODE_PATTERN = "[A-Za-z]{1,12}[A-Za-z0-9_-]*\\d[A-Za-z0-9_-]*";
+const TEXT_LABEL_BOUNDARIES = [
+  "单据编号",
+  "单据号",
+  "配送单号",
+  "订单号",
+  "调拨单号",
+  "单据状态",
+  "复审状态",
+  "分拣状态",
+  "订单日期",
+  "预计发货日期",
+  "期望到货日期",
+  "发货日期",
+  "发货操作时间",
+  "收货机构",
+  "订货机构",
+  "供货机构",
+  "送货机构",
+  "业务模式",
+  "配送重量",
+  "制单日期",
+  "创建人",
+  "发货人",
+  "收货人",
+  "收货电话",
+  "联系电话",
+  "电话",
+  "收货地址",
+  "打印次数",
+  "备注"
+];
 
 export type ParseResult = {
   rows: OrderRow[];
@@ -118,6 +193,7 @@ export function parseWithRule(source: ParsedSource, rule: ParseRule): ParseResul
   let rowObjects: RowObject[] = [];
 
   const activeStrategies = rule.strategies.filter((strategy) => strategy.enabled !== false);
+  const textStrategies = activeStrategies.filter((strategy): strategy is Extract<ParseStrategy, { type: "textSegments" }> => strategy.type === "textSegments");
 
   for (const strategy of activeStrategies) {
     if (source.kind === "workbook" && acceptsWorkbook(strategy)) {
@@ -128,9 +204,22 @@ export function parseWithRule(source: ParsedSource, rule: ParseRule): ParseResul
     }
   }
 
+  if (source.kind === "text" && (!textStrategies.length || !rowObjects.some(isLikelyItemRecord))) {
+    const fallbackRows = parseAutoTextSource(source, rule);
+    if (fallbackRows.length) {
+      rowObjects = textStrategies.length ? rowObjects.concat(fallbackRows) : fallbackRows;
+      warnings.push(
+        textStrategies.length
+          ? "文本/PDF规则未解析出有效明细，已启用通用文本兜底解析"
+          : "当前文件是文本/PDF，已启用通用文本兜底解析"
+      );
+    }
+  }
+
   const rows = rowObjects
+    .filter(isLikelyItemRecord)
     .map((row, index) => normalizeRow(row, index))
-    .filter((row) => toText(row.skuCode) || toText(row.skuName) || toText(row.quantity));
+    .filter(isLikelyItemRecord);
 
   return {
     rows,
@@ -193,11 +282,14 @@ function parseTableSheet(
   const dataStart = headerIndex + (strategy.dataStartRowOffset ?? 1);
   const common = collectCommon(sheet, rule, strategy, undefined);
   const rows: RowObject[] = [];
+  const columns = normalizeColumns(strategy.columns, DEFAULT_ITEM_COLUMNS);
+  let dataStarted = false;
 
   for (let rowIndex = dataStart; rowIndex < sheet.rows.length; rowIndex += 1) {
     const row = sheet.rows[rowIndex] ?? [];
     if (isEffectivelyEmpty(row)) continue;
     if (shouldStop(row, header, strategy.stopWhen)) break;
+    if (dataStarted && isDetailStopRow(row, header)) break;
     if (matchesAnyCell(row, strategy.skipRowsWhen?.textMatches ?? [])) continue;
 
     const record = materializeRecord({
@@ -205,7 +297,7 @@ function parseTableSheet(
       header,
       sheet,
       rowIndex,
-      columns: normalizeColumns(strategy.columns, DEFAULT_ITEM_COLUMNS),
+      columns,
       defaults: { ...rule.defaults, ...strategy.defaults },
       common
     });
@@ -215,7 +307,13 @@ function parseTableSheet(
       if (!ok) continue;
     }
 
+    if (!isLikelyItemRecord(record)) {
+      if (dataStarted && isDetailStopRow(row, header)) break;
+      continue;
+    }
+
     rows.push(record);
+    dataStarted = true;
   }
 
   return aggregateIfNeeded(rows, strategy.aggregateBy);
@@ -256,11 +354,13 @@ function parseMatrixSheet(
   const cellMode = runtime.cell?.mode ?? "quantity";
   const rows: RowObject[] = [];
   const dataStart = typeof runtime.dataStartRow === "number" ? runtime.dataStartRow : headerIndex + (runtime.dataStartRowOffset ?? 1);
+  let dataStarted = false;
 
   for (let rowIndex = dataStart; rowIndex < sheet.rows.length; rowIndex += 1) {
     const row = sheet.rows[rowIndex] ?? [];
     if (isEffectivelyEmpty(row)) continue;
     if (shouldStop(row, header, strategy.stopWhen)) break;
+    if (dataStarted && isDetailStopRow(row, header)) break;
 
     const base = materializeRecord({
       row,
@@ -271,6 +371,8 @@ function parseMatrixSheet(
       defaults: { ...rule.defaults, ...strategy.defaults },
       common
     });
+
+    if (!hasSkuIdentity(base) || isDetailStopRow(row, header)) continue;
 
     for (let colIndex = start; colIndex <= end; colIndex += 1) {
       if (!isLikelyPivotHeader(pivotHeaderRow[colIndex], runtime.pivot?.columns?.excludeCandidates)) continue;
@@ -290,10 +392,11 @@ function parseMatrixSheet(
           sourceSheet: sheet.name,
           sourceRow: rowIndex + 1
         });
+        dataStarted = true;
       } else {
         const itemRows = splitCompositeItems(cellText, runtime.cell?.itemPattern);
         itemRows.forEach((item, itemIndex) => {
-          rows.push({
+          const record = {
             ...base,
             [pivotField]: `${pivot.valuePrefix ?? ""}${pivotLabel}`,
             skuName: item.name || base.skuName || "",
@@ -302,7 +405,11 @@ function parseMatrixSheet(
             spec: item.spec || base.spec || "",
             sourceSheet: sheet.name,
             sourceRow: rowIndex + 1
-          });
+          };
+          if (isLikelyItemRecord(record)) {
+            rows.push(record);
+            dataStarted = true;
+          }
         });
       }
     }
@@ -350,7 +457,7 @@ function parseCardSheet(
     for (let localRow = headerOffset + 1; localRow < cardRows.length; localRow += 1) {
       const row = cardRows[localRow] ?? [];
       if (isEffectivelyEmpty(row)) continue;
-      if (matchesAnyCell(row, ["合计", "总计"])) break;
+      if (isDetailStopRow(row, header) || matchesAnyCell(row, ["合计", "总计"])) break;
       const record = materializeRecord({
         row,
         header,
@@ -360,9 +467,48 @@ function parseCardSheet(
         defaults: { ...rule.defaults, ...strategy.defaults },
         common
       });
-      if ((toText(record.skuCode) || toText(record.skuName)) && toText(record.quantity)) rows.push(record);
+      if (isLikelyItemRecord(record)) rows.push(record);
     }
   });
+
+  return rows;
+}
+
+function parseAutoTextSource(source: TextSource, rule: ParseRule) {
+  const text = source.text.replace(/\s+/g, " ").trim();
+  const common = {
+    ...rule.defaults,
+    ...evaluateTextCommon(source.text, rule.common),
+    externalCode: extractTextLabel(source.text, ["单据编号", "单据号", "配送单号", "订单号", "调拨单号"]) || rule.defaults?.externalCode || "",
+    storeName: extractTextLabel(source.text, ["收货机构", "收货门店", "调入门店", "门店"]) || rule.defaults?.storeName || "",
+    receiverName: extractTextLabel(source.text, ["收货人", "收件人", "联系人"]) || rule.defaults?.receiverName || "",
+    receiverPhone: extractTextLabel(source.text, ["收货电话", "联系电话", "电话", "手机"]) || rule.defaults?.receiverPhone || "",
+    receiverAddress: extractTextLabel(source.text, ["收货地址", "地址"]) || rule.defaults?.receiverAddress || ""
+  };
+  const rows: RowObject[] = [];
+  const itemRe = new RegExp(
+    `(?:^|\\s)(?<lineNo>\\d{1,4})\\s+(?<category>[^\\s]+)\\s+(?<skuCode>${TEXT_ITEM_CODE_PATTERN})\\s*(?<detail>[\\s\\S]*?)(?=\\s+\\d{1,4}\\s+[^\\s]+\\s+${TEXT_ITEM_CODE_PATTERN}|\\s+合\\s*计|\\s+物品类别|\\s+第\\d+页|$)`,
+    "g"
+  );
+
+  for (const match of text.matchAll(itemRe)) {
+    const detail = toText(match.groups?.detail);
+    const quantityMatch = detail.match(/(?:^|\s)(\d+(?:,\d{3})*(?:\.\d+)?)\s*$/);
+    if (!quantityMatch) continue;
+    const detailWithoutQuantity = toText(detail.slice(0, quantityMatch.index));
+    const itemText = stripTrailingUnit(detailWithoutQuantity);
+    const item = splitNameAndSpec(itemText);
+    const record: RowObject = {
+      ...common,
+      skuCode: toText(match.groups?.skuCode),
+      skuName: item.name,
+      spec: item.spec,
+      quantity: normalizeQuantity(quantityMatch[1]),
+      sourceSheet: "文本/PDF",
+      sourceRow: Number(match.groups?.lineNo) || rows.length + 1
+    };
+    if (isLikelyItemRecord(record)) rows.push(record);
+  }
 
   return rows;
 }
@@ -762,6 +908,88 @@ function isEffectivelyEmpty(row: CellValue[]) {
   return row.every((cell) => !toText(cell));
 }
 
+function isDetailStopRow(row: CellValue[], header?: CellValue[]) {
+  const values = row.map(toText).filter(Boolean);
+  if (!values.length) return false;
+  const normalizedValues = values.map(normalizeText);
+  const first = normalizedValues[0] ?? "";
+  const rowText = normalizedValues.join("|");
+  const nonEmptyCount = values.length;
+
+  if (/^▶/.test(values[0] ?? "")) return true;
+  if (/^(合计|总计|小计)/.test(first)) return true;
+  if (rowText.includes("合计:") || rowText.includes("合计：")) return true;
+  if (looksLikeRepeatedHeader(row, header)) return true;
+  if (normalizedValues.some((value) => /^第\d+页/.test(value) || /第\d+页\/共\d+页/.test(value))) return true;
+
+  const hitCount = DETAIL_STOP_KEYWORDS.reduce((sum, keyword) => {
+    const normalized = normalizeText(keyword);
+    return normalizedValues.some((value) => value === normalized || value.includes(normalized)) ? sum + 1 : sum;
+  }, 0);
+
+  return hitCount >= 2 || (nonEmptyCount <= 3 && hitCount >= 1);
+}
+
+function looksLikeRepeatedHeader(row: CellValue[], header?: CellValue[]) {
+  const values = row.map(normalizeText).filter(Boolean);
+  if (!values.length) return false;
+  const headerValues = (header ?? []).map(normalizeText).filter(Boolean);
+  const itemHeaderHits = DEFAULT_ITEM_HEADER_KEYWORDS.filter((keyword) => {
+    const normalized = normalizeText(keyword);
+    return values.some((value) => value === normalized || value.includes(normalized));
+  }).length;
+
+  if (itemHeaderHits >= 2) return true;
+  if (!headerValues.length) return false;
+
+  const overlap = values.filter((value) => headerValues.includes(value)).length;
+  return overlap >= Math.min(3, values.length) && values.length <= headerValues.length + 2;
+}
+
+function isLikelyItemRecord(record: Partial<Record<FieldKey, string>>) {
+  const quantity = normalizeQuantity(record.quantity);
+  if (!quantity) return false;
+  if (!hasSkuIdentity(record)) return false;
+
+  const skuCode = normalizeText(record.skuCode);
+  const skuName = normalizeText(record.skuName);
+  const spec = normalizeText(record.spec);
+  const identity = [skuCode, skuName].filter(Boolean);
+  if (!identity.length) return false;
+
+  const hasNonItemIdentity = identity.some((value) =>
+    NON_ITEM_KEYWORDS.some((keyword) => {
+      const normalized = normalizeText(keyword);
+      return value === normalized || value.includes(normalized);
+    })
+  );
+  if (hasNonItemIdentity) return false;
+  if (skuCode && !looksLikeSkuCode(skuCode) && !skuName) return false;
+  if (!skuCode && skuName && looksLikeControlText(skuName)) return false;
+  if (spec && looksLikeControlText(spec) && !skuName) return false;
+
+  return true;
+}
+
+function hasSkuIdentity(record: Partial<Record<FieldKey, string>>) {
+  return Boolean(toText(record.skuCode) || toText(record.skuName));
+}
+
+function looksLikeSkuCode(value: string) {
+  if (!value) return false;
+  if (value.length > 64) return false;
+  if (NON_ITEM_KEYWORDS.some((keyword) => value === normalizeText(keyword))) return false;
+  return /[a-z0-9]/i.test(value) || /^[\u4e00-\u9fa5]{2,}[a-z0-9_-]*$/i.test(value);
+}
+
+function looksLikeControlText(value: string) {
+  if (!value) return false;
+  return NON_ITEM_KEYWORDS.some((keyword) => {
+    const normalized = normalizeText(keyword);
+    return value === normalized || value.includes(normalized);
+  });
+}
+
 function aggregateIfNeeded(rows: RowObject[], field?: FieldKey) {
   if (!field) return rows;
   const commonByKey = new Map<string, Partial<Record<FieldKey, string>>>();
@@ -798,10 +1026,59 @@ function splitCompositeItems(text: string, customPattern?: string) {
     .filter((item): item is { code: string; name: string; quantity: string; spec: string } => Boolean(item?.quantity));
 }
 
+function extractTextLabel(text: string, labels: string[]) {
+  const boundaries = uniqueText([...TEXT_LABEL_BOUNDARIES, ...labels]).map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  for (const label of labels) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = text.match(new RegExp(`${escaped}\\s*[:：]\\s*([^\\n\\r]+?)(?=\\s*(?:${boundaries.join("|")})\\s*[:：]|\\n|$)`, "i"));
+    if (match) return cleanupTextValue(match[1]);
+  }
+  return "";
+}
+
+function cleanupTextValue(value: string) {
+  return toText(value)
+    .replace(/\s*(?:物品类别|物品编码|物品名称|规格型号|订货单位|发货数量|备注).*$/i, "")
+    .replace(/\s*第\d+页\s*\/\s*共\d+页.*$/i, "")
+    .trim();
+}
+
+function stripTrailingUnit(value: string) {
+  const text = toText(value);
+  return text.replace(/\s+(?:件|包|瓶|桶|盒|箱|袋|顶|条|套|个|斤|公斤|kg|KG|码|均码|L码|XL码|2XL码|3XL码|4XL码)$/i, "").trim();
+}
+
+function splitNameAndSpec(value: string) {
+  const text = toText(value);
+  if (!text) return { name: "", spec: "" };
+
+  const specStart = text.search(
+    /(?:\d+(?:\.\d+)?\s*(?:ml|l|g|kg|KG|斤|公斤|瓶|包|袋|盒|桶|箱|件|片|码)|均码|[234]?XL码|L码|M码|S码|\d+(?:\.\d+)?\s*[*×xX]\s*\d+)/i
+  );
+  if (specStart > 0) {
+    return {
+      name: toText(text.slice(0, specStart)),
+      spec: toText(text.slice(specStart))
+    };
+  }
+
+  const tailSpec = text.match(/^(?<name>.+?)\s+(?<spec>(?:均码|[234]?XL码|L码|M码|S码))$/i);
+  if (tailSpec?.groups) return { name: toText(tailSpec.groups.name), spec: toText(tailSpec.groups.spec) };
+
+  return { name: text, spec: "" };
+}
+
 function numericText(value: string) {
   const match = value.match(/-?\d+(?:\.\d+)?/);
   if (!match) return "";
   const numeric = Number(match[0]);
+  return Number.isFinite(numeric) && numeric > 0 ? String(numeric) : "";
+}
+
+function normalizeQuantity(value: unknown) {
+  const text = toText(value).replace(/,/g, "");
+  if (!/^\d+(?:\.\d+)?$/.test(text)) return "";
+  const numeric = Number(text);
   return Number.isFinite(numeric) && numeric > 0 ? String(numeric) : "";
 }
 

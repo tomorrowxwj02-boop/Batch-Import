@@ -867,9 +867,11 @@ select:focus,
 
 .error-summary {
   min-height: 62px;
+  max-height: 126px;
   display: flex;
   align-items: flex-start;
   gap: 10px;
+  overflow: auto;
   padding: 10px 12px;
   margin-bottom: 10px;
   border: 1px solid #dcecef;
@@ -889,6 +891,7 @@ select:focus,
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .table-wrap {
@@ -1277,9 +1280,9 @@ select:focus,
 .toast {
   position: fixed;
   right: 24px;
-  top: 24px;
+  top: calc(var(--nav-height) + 16px);
   max-width: min(420px, calc(100vw - 48px));
-  z-index: 20;
+  z-index: 80;
   border-radius: 8px;
   padding: 12px 14px;
   color: #fff;
