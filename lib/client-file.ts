@@ -48,10 +48,10 @@ async function parseDocx(file: File, onProgress?: (percent: number, label: strin
 }
 
 async function parsePdf(file: File, onProgress?: (percent: number, label: string) => void): Promise<ParsedSource> {
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdfjs = await import("pdfjs-dist/legacy/webpack.mjs");
   const data = new Uint8Array(await file.arrayBuffer());
   onProgress?.(35, "读取 PDF");
-  const loadingTask = pdfjs.getDocument({ data, disableWorker: true } as any);
+  const loadingTask = pdfjs.getDocument({ data } as any);
   const pdf = await loadingTask.promise;
   const pages: string[] = [];
   for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
