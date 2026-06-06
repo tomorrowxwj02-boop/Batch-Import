@@ -28,11 +28,12 @@ import { parseFileToSource, sampleSource, sourceStats } from "@/lib/client-file"
 import { parseWithRule } from "@/lib/rule-engine";
 import { ColumnSelector, FIELD_LABELS, FieldKey, OrderRow, ParsedSource, ParseRule, ParseStrategy, RuleRecord, ValidationIssue } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { EDITABLE_FIELDS, emptyRow, issueMap, validateRows } from "@/lib/validation";
+import { DuplicateValidationContext, EDITABLE_FIELDS, emptyRow, issueMap, validateRows } from "@/lib/validation";
 
 type Toast = { type: "success" | "error" | "info"; text: string };
 type ActivePage = "import" | "rules";
 type ProgressState = { percent: number; label: string; current?: number; total?: number };
+type DuplicateResponse = { externalCodes?: string[]; lineKeys?: string[]; codes?: string[] };
 
 type HistoryItem = {
   id: number;
@@ -115,7 +116,7 @@ export function ImporterApp() {
   const [source, setSource] = useState<ParsedSource | null>(null);
   const [fileName, setFileName] = useState("");
   const [rows, setRows] = useState<OrderRow[]>([]);
-  const [existingCodes, setExistingCodes] = useState<Set<string>>(new Set());
+  const [duplicateContext, setDuplicateContext] = useState<DuplicateValidationContext>(() => emptyDuplicateContext());
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
   const [progress, setProgress] = useState<ProgressState>({ percent: 0, label: "等待上传" });
   const [busy, setBusy] = useState("");
@@ -162,8 +163,8 @@ export function ImporterApp() {
   }, [toast]);
 
   useEffect(() => {
-    setIssues(validateRows(rows, existingCodes));
-  }, [rows, existingCodes]);
+    setIssues(validateRows(rows, duplicateContext));
+  }, [rows, duplicateContext]);
 
   const stats = source ? sourceStats(source) : null;
   const errors = issues.filter((issue) => issue.severity === "error");
@@ -222,6 +223,7 @@ export function ImporterApp() {
     setBusy("file");
     setRows([]);
     setIssues([]);
+    setDuplicateContext(emptyDuplicateContext());
     setAiNotes([]);
     setFileName(file.name);
     try {
@@ -324,23 +326,22 @@ export function ImporterApp() {
   }
 
   async function checkDuplicates(nextRows: OrderRow[]) {
-    const codes = nextRows.map((row) => row.externalCode).filter(Boolean);
-    if (!codes.length) {
-      setExistingCodes(new Set());
-      return;
+    const lookupRows = nextRows.map((row) => ({ externalCode: row.externalCode, skuCode: row.skuCode }));
+    if (!lookupRows.some((row) => row.externalCode)) {
+      const empty = emptyDuplicateContext();
+      setDuplicateContext(empty);
+      return empty;
     }
-    try {
-      const res = await fetch("/api/duplicates", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ codes })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "重复检测失败");
-      setExistingCodes(new Set(data.codes ?? []));
-    } catch (error) {
-      showToast("error", getMessage(error));
-    }
+    const res = await fetch("/api/duplicates", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ rows: lookupRows })
+    });
+    const data = (await res.json()) as DuplicateResponse & { error?: string };
+    if (!res.ok) throw new Error(data.error || "重复检测失败");
+    const context = duplicateContextFromResponse(data);
+    setDuplicateContext(context);
+    return context;
   }
 
   async function saveRule() {
@@ -506,33 +507,51 @@ export function ImporterApp() {
   }
 
   async function submitOrders() {
-    const currentIssues = validateRows(rows, existingCodes).filter((issue) => issue.severity === "error");
-    setIssues(validateRows(rows, existingCodes));
     if (!rows.length) {
       showToast("error", "没有可提交的数据");
       return;
     }
-    if (currentIssues.length) {
-      showToast("error", `还有 ${currentIssues.length} 个错误，请先修正`);
+    const localIssues = validateRows(rows);
+    const localErrors = localIssues.filter((issue) => issue.severity === "error");
+    if (localErrors.length) {
+      setIssues(localIssues);
+      showToast("error", `还有 ${localErrors.length} 个错误，请先修正`);
       return;
     }
     setBusy("submit");
-    setProgress({ percent: 82, label: `正在提交下单：0/${rows.length} 条 SKU`, current: 0, total: rows.length });
+    setProgress({ percent: 72, label: `正在检查重复：0/${rows.length} 条 SKU`, current: 0, total: rows.length });
     try {
+      const latestDuplicateContext = await checkDuplicates(rows);
+      const currentIssues = validateRows(rows, latestDuplicateContext);
+      const currentErrors = currentIssues.filter((issue) => issue.severity === "error");
+      setIssues(currentIssues);
+      if (currentErrors.length) {
+        setProgress({ percent: 100, label: `重复校验未通过：发现 ${currentErrors.length} 个错误`, current: 0, total: rows.length });
+        showToast("error", `发现 ${currentErrors.length} 个重复或错误，已阻止提交`);
+        return;
+      }
+      setProgress({ percent: 82, label: `正在提交下单：0/${rows.length} 条 SKU`, current: 0, total: rows.length });
       const res = await fetch("/api/orders", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ rows, sourceFile: fileName })
       });
       const data = await res.json();
+      if (Array.isArray(data.issues)) setIssues(data.issues);
       if (!res.ok) throw new Error(data.error || "提交失败");
+      const failedCount = data.failed?.length ?? 0;
+      const successCount = Number(data.success ?? 0);
       setProgress({
         percent: 100,
-        label: `提交完成：成功 ${data.success}/${rows.length} 条 SKU，失败 ${data.failed?.length ?? 0} 条`,
-        current: Number(data.success ?? 0),
+        label: `提交完成：成功 ${successCount}/${rows.length} 条 SKU，失败 ${failedCount} 条`,
+        current: successCount,
         total: rows.length
       });
-      showToast("success", `提交完成：成功 ${data.success} 条 SKU，生成 ${data.orderCount ?? "-"} 张运单，失败 ${data.failed?.length ?? 0} 条`);
+      if (failedCount || successCount !== rows.length) {
+        showToast("error", `提交未完全成功：成功 ${successCount} 条，失败 ${failedCount} 条`);
+      } else {
+        showToast("success", `提交完成：成功 ${successCount} 条 SKU，生成 ${data.orderCount ?? "-"} 张运单`);
+      }
       await loadHistory(1);
       await checkDuplicates(rows);
     } catch (error) {
@@ -1878,6 +1897,21 @@ function normalizeHistoryItem(input: Record<string, unknown>): HistoryItem {
     spec: input.spec == null ? null : String(input.spec),
     remark: input.remark == null ? null : String(input.remark),
     created_at: String(input.created_at ?? "")
+  };
+}
+
+function emptyDuplicateContext(): DuplicateValidationContext {
+  return {
+    existingExternalCodes: new Set<string>(),
+    existingLineKeys: new Set<string>()
+  };
+}
+
+function duplicateContextFromResponse(data: DuplicateResponse): DuplicateValidationContext {
+  const externalCodes = data.externalCodes ?? data.codes ?? [];
+  return {
+    existingExternalCodes: new Set(externalCodes.map((value) => String(value).toLowerCase())),
+    existingLineKeys: new Set((data.lineKeys ?? []).map((value) => String(value).toLowerCase()))
   };
 }
 

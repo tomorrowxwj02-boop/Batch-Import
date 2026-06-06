@@ -1,6 +1,12 @@
 import { FIELD_LABELS, FieldKey, OrderRow, ValidationIssue } from "@/lib/types";
 import { toText } from "@/lib/utils";
 
+export type DuplicateLookupRow = { externalCode?: string | null; skuCode?: string | null };
+export type DuplicateValidationContext = {
+  existingExternalCodes?: Set<string>;
+  existingLineKeys?: Set<string>;
+};
+
 export const EDITABLE_FIELDS: FieldKey[] = [
   "externalCode",
   "storeName",
@@ -15,6 +21,20 @@ export const EDITABLE_FIELDS: FieldKey[] = [
 ];
 
 const PHONE_RE = /^(\+?86[-\s]?)?1[3-9]\d{9}$|^0\d{2,3}[-\s]?\d{7,8}$/;
+
+export function makeExternalCodeKey(value: unknown) {
+  return toText(value).toLowerCase();
+}
+
+export function makeSkuCodeKey(value: unknown) {
+  return toText(value).toLowerCase();
+}
+
+export function makeOrderLineKey(row: DuplicateLookupRow) {
+  const externalCode = makeExternalCodeKey(row.externalCode);
+  const skuCode = makeSkuCodeKey(row.skuCode);
+  return externalCode && skuCode ? `${externalCode}::${skuCode}` : "";
+}
 
 export function emptyRow(rowNo: number): OrderRow {
   return {
@@ -33,9 +53,11 @@ export function emptyRow(rowNo: number): OrderRow {
   };
 }
 
-export function validateRows(rows: OrderRow[], existingDuplicateCodes = new Set<string>()) {
+export function validateRows(rows: OrderRow[], duplicateContext: DuplicateValidationContext = {}) {
   const issues: ValidationIssue[] = [];
   const seenLine = new Map<string, number>();
+  const existingExternalCodes = duplicateContext.existingExternalCodes ?? new Set<string>();
+  const existingLineKeys = duplicateContext.existingLineKeys ?? new Set<string>();
 
   rows.forEach((row, index) => {
     const rowNo = index + 1;
@@ -69,26 +91,37 @@ export function validateRows(rows: OrderRow[], existingDuplicateCodes = new Set<
     }
 
     const externalCode = toText(row.externalCode);
-    if (externalCode && existingDuplicateCodes.has(externalCode)) {
+    const lineKey = makeOrderLineKey(row);
+    if (lineKey && existingLineKeys.has(lineKey)) {
+      issues.push({
+        rowId: row.id,
+        rowNo,
+        field: "skuCode",
+        message: "该外部编码下的 SKU 已存在，请勿重复提交",
+        severity: "error"
+      });
+    }
+
+    const externalCodeKey = makeExternalCodeKey(externalCode);
+    if (externalCodeKey && existingExternalCodes.has(externalCodeKey) && (!lineKey || !existingLineKeys.has(lineKey))) {
       issues.push({
         rowId: row.id,
         rowNo,
         field: "externalCode",
-        message: "外部编码已存在，将作为同一运单追加/合并 SKU，请核对明细",
+        message: "外部编码已存在，本行会作为该运单的新 SKU 明细追加",
         severity: "warning"
       });
     }
 
-    const lineKey = `${externalCode || `row-${rowNo}`}::${toText(row.skuCode)}::${toText(row.skuName)}`;
-    if (toText(row.skuCode) || toText(row.skuName)) {
+    if (lineKey) {
       const first = seenLine.get(lineKey);
       if (first) {
         issues.push({
           rowId: row.id,
           rowNo,
-          field: "externalCode",
-          message: `与第 ${first} 行可能重复`,
-          severity: "warning"
+          field: "skuCode",
+          message: `与第 ${first} 行外部编码和 SKU 重复`,
+          severity: "error"
         });
       } else {
         seenLine.set(lineKey, rowNo);

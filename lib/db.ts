@@ -1,5 +1,6 @@
 import { neon } from "@neondatabase/serverless";
 import { ParseRule } from "@/lib/types";
+import { DuplicateLookupRow, makeExternalCodeKey, makeOrderLineKey, makeSkuCodeKey } from "@/lib/validation";
 
 let migrationPromise: Promise<void> | null = null;
 
@@ -62,6 +63,24 @@ export async function ensureSchema() {
       await db`create index if not exists imported_orders_external_code_idx on imported_orders (external_code)`;
       await db`create index if not exists imported_orders_receiver_name_idx on imported_orders (receiver_name)`;
       await db`create index if not exists imported_orders_created_at_idx on imported_orders (created_at desc)`;
+      await db`
+        with ranked as (
+          select id,
+                 row_number() over (
+                   partition by lower(trim(external_code)), lower(trim(sku_code))
+                   order by id asc
+                 ) as row_no
+          from imported_orders
+          where nullif(trim(external_code), '') is not null
+        )
+        delete from imported_orders
+        where id in (select id from ranked where row_no > 1)
+      `;
+      await db`
+        create unique index if not exists imported_orders_external_sku_unique_idx
+        on imported_orders (lower(trim(external_code)), lower(trim(sku_code)))
+        where nullif(trim(external_code), '') is not null
+      `;
     })();
   }
   return migrationPromise;
@@ -120,6 +139,40 @@ export async function findExistingExternalCodes(codes: string[]) {
     where external_code = any(${cleaned})
   `;
   return rows.map((row) => String(row.external_code));
+}
+
+export async function findExistingOrderDuplicates(inputRows: DuplicateLookupRow[]) {
+  await ensureSchema();
+  const requestedRows = inputRows
+    .map((row) => ({
+      externalCode: makeExternalCodeKey(row.externalCode),
+      skuCode: makeSkuCodeKey(row.skuCode)
+    }))
+    .filter((row) => row.externalCode);
+  const externalCodes = Array.from(new Set(requestedRows.map((row) => row.externalCode)));
+  if (!externalCodes.length) return { externalCodes: [], lineKeys: [] };
+
+  const db = sql();
+  const existingRows = await db`
+    select distinct external_code, sku_code
+    from imported_orders
+    where lower(trim(external_code)) = any(${externalCodes})
+  `;
+  const requestedLineKeys = new Set(inputRows.map(makeOrderLineKey).filter(Boolean));
+  const existingExternalCodes = new Set<string>();
+  const existingLineKeys = new Set<string>();
+
+  existingRows.forEach((row) => {
+    const externalCode = makeExternalCodeKey(row.external_code);
+    const lineKey = makeOrderLineKey({ externalCode: row.external_code, skuCode: row.sku_code });
+    if (externalCode) existingExternalCodes.add(externalCode);
+    if (lineKey && requestedLineKeys.has(lineKey)) existingLineKeys.add(lineKey);
+  });
+
+  return {
+    externalCodes: Array.from(existingExternalCodes),
+    lineKeys: Array.from(existingLineKeys)
+  };
 }
 
 export async function insertOrders(input: {
@@ -436,6 +489,7 @@ export async function createOrderItem(orderKey: string, input: OrderItemInput) {
     throw new Error("请先为运单填写外部编码，再新增多 SKU 明细");
   }
   const item = normalizeItemInput(input);
+  await assertNoDuplicateOrderItem(db, order.external_code, item.skuCode);
   const rows = await db`
     insert into imported_orders (
       external_code, store_name, receiver_name, receiver_phone, receiver_address,
@@ -456,6 +510,7 @@ export async function updateOrderItem(id: number, input: OrderItemInput) {
   await ensureSchema();
   const db = sql();
   const item = normalizeItemInput(input);
+  await assertNoDuplicateOrderItemForUpdate(db, id, item.skuCode);
   const rows = await db`
     update imported_orders
     set sku_code = ${item.skuCode},
@@ -537,4 +592,30 @@ function normalizeItemInput(input: OrderItemInput) {
     spec: cleanNullable(input.spec),
     remark: cleanNullable(input.remark)
   };
+}
+
+async function assertNoDuplicateOrderItem(db: ReturnType<typeof sql>, externalCode: string, skuCode: string) {
+  const rows = await db`
+    select id
+    from imported_orders
+    where lower(trim(external_code)) = ${makeExternalCodeKey(externalCode)}
+      and lower(trim(sku_code)) = ${makeSkuCodeKey(skuCode)}
+    limit 1
+  `;
+  if (rows.length) throw new Error("该外部编码下的 SKU 已存在，请勿重复新增");
+}
+
+async function assertNoDuplicateOrderItemForUpdate(db: ReturnType<typeof sql>, id: number, skuCode: string) {
+  const rows = await db`
+    select existing.id
+    from imported_orders current_row
+    join imported_orders existing
+      on lower(trim(existing.external_code)) = lower(trim(current_row.external_code))
+     and lower(trim(existing.sku_code)) = ${makeSkuCodeKey(skuCode)}
+     and existing.id <> current_row.id
+    where current_row.id = ${id}
+      and nullif(trim(current_row.external_code), '') is not null
+    limit 1
+  `;
+  if (rows.length) throw new Error("该外部编码下的 SKU 已存在，请勿重复保存");
 }
