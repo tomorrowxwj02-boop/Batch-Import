@@ -861,7 +861,9 @@ function evaluateCommonExtractors(extractors: Partial<Record<FieldKey, Extractor
   const common: Partial<Record<FieldKey, string>> = {};
   FIELDS.forEach((field) => {
     const extractor = extractors?.[field];
-    if (extractor) common[field] = evaluateExtractor(extractor, sheet);
+    if (!extractor) return;
+    const value = evaluateExtractor(extractor, sheet);
+    if (toText(value)) common[field] = value;
   });
   return common;
 }
@@ -924,7 +926,9 @@ function collectCommon(
   const common: Partial<Record<FieldKey, string>> = {};
   FIELDS.forEach((field) => {
     const extractor = commonExtractors[field];
-    if (extractor) common[field] = evaluateExtractor(extractor, sheet);
+    if (!extractor) return;
+    const value = evaluateExtractor(extractor, sheet);
+    if (toText(value)) common[field] = value;
   });
   return common;
 }
